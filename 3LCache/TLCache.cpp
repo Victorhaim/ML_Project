@@ -263,7 +263,7 @@ uint32_t TLCacheCache::rank() {
             }
             samplepointer = in_cache.dq[samplepointer].next;
         }
-        // 
+        // Count the number of samples
         spointer_timestamp = in_cache.metas[sampled_objects.back()]._past_timestamp;
         evcition_distribution[1] += sample_rate;
     }
@@ -278,12 +278,13 @@ vector<uint32_t> TLCacheCache::quick_demotion() {
     while (new_obj_size > _currentSize * reserved_space / 100  && j < sample_rate * 1.5 && i < new_obj_keys.size()) {
         auto it = key_map.find(new_obj_keys[i]);
         if (it != key_map.end()) {
-            // Object in cache
             if (it->second.list_idx == 0) {
+                // Object in cache
                 new_obj_size -= in_cache.metas[it->second.list_pos]._size;
                 sampled_objects.emplace_back(it->second.list_pos);
                 j++;
             } else {
+                // Object not in cache
                 new_obj_size -= out_cache.metas[it->second.list_pos - out_cache.front_index]._size;
             }
         }
@@ -296,9 +297,11 @@ vector<uint32_t> TLCacheCache::quick_demotion() {
     return sampled_objects;
 }
 
+// evict an object at a time
 void TLCacheCache::evict() {
     // get eviction objects
     auto epair = evict_predobj();
+    // evict a object
     evict_with_candidate(epair);
 }
 

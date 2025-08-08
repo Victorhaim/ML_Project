@@ -138,6 +138,9 @@ static inline cache_t *create_cache(const char *trace_path, const char *eviction
     cache = QDLP_init(cc_params, eviction_params);
   } else if (strcasecmp(eviction_algo, "sieve") == 0) {
     cache = Sieve_init(cc_params, eviction_params);
+  } else if (strcasecmp(eviction_algo, "3LCache+") == 0) {
+    eviction_params = "objective=byte-miss-ratio";
+    cache = TLCache_new_init(cc_params, eviction_params);
   } else if (strcasecmp(eviction_algo, "3LCache-OMR") == 0) {
     eviction_params = "objective=object-miss-ratio";
     cache = TLCache_init(cc_params, eviction_params);
