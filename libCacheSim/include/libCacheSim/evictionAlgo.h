@@ -130,7 +130,7 @@ cache_t *RandomLRU_init(const common_cache_params_t ccache_params, const char *c
 
 cache_t *TLCache_init(const common_cache_params_t ccache_params, const char *cache_specific_params);
 
-cache_t *TLCache_new_init(const common_cache_params_t ccache_params, const char *cache_specific_params);
+cache_t *TLCacheN_init(const common_cache_params_t ccache_params, const char *cache_specific_params);
 
 #ifdef ENABLE_LRB
 cache_t *LRB_init(const common_cache_params_t ccache_params, const char *cache_specific_params);

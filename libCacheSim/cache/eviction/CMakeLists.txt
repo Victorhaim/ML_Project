@@ -95,8 +95,8 @@ set (sourceCPP ${sourceCPP}
 )
 
 set (sourceCPP ${sourceCPP} 
-    ../../../../3LCache+/TLCache.cpp
-    ../../../../3LCache+/TLCache_OMR_Interface.cpp
+    ../../../../3LCache+/TLCacheN.cpp
+    ../../../../3LCache+/TLCacheN_Interface.cpp
 )
 
 if (ENABLE_GLCACHE)

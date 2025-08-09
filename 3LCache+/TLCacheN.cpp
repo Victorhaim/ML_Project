@@ -1,13 +1,13 @@
-#include "TLCache.h"
+#include "TLCacheN.h"
 #include <algorithm>
 #include "utils.h"
 #include <chrono>
 
 using namespace chrono;
 using namespace std;
-using namespace TLCache;
+using namespace TLCacheN;
 // model training
-void TLCacheCache::train() {
+void TLCacheNCache::train() {
     MAX_EVICTION_BOUNDARY[0] = MAX_EVICTION_BOUNDARY[1];
     auto timeBegin = chrono::system_clock::now();
     if (booster) LGBM_BoosterFree(booster);
@@ -50,7 +50,7 @@ void TLCacheCache::train() {
 }
 
 // Acquire training samples
-void TLCacheCache::get_sample(Meta &meta, uint64_t cur_seq, bool isHit) {
+void TLCacheNCache::get_sample(Meta &meta, uint64_t cur_seq, bool isHit) {
     if (MAX_EVICTION_BOUNDARY[1] < (cur_seq - meta._past_timestamp))
         MAX_EVICTION_BOUNDARY[1] = (cur_seq - meta._past_timestamp);
     uint64_t future_distance = cur_seq - meta._past_timestamp;
@@ -83,10 +83,10 @@ void TLCacheCache::get_sample(Meta &meta, uint64_t cur_seq, bool isHit) {
     }  
 }
 
-void TLCacheCache::update_stat_periodic() {
+void TLCacheNCache::update_stat_periodic() {
 }
 
-bool TLCacheCache::lookup(const SimpleRequest &req) {
+bool TLCacheNCache::lookup(const SimpleRequest &req) {
     // assert(true);
     bool ret;
     ++current_seq;
@@ -133,7 +133,7 @@ bool TLCacheCache::lookup(const SimpleRequest &req) {
 }
 
 // Delete object metadata that exceeds the window
-void TLCacheCache::forget() {
+void TLCacheNCache::forget() {
     int MAX_SIZE = in_cache_metas.size() * hsw + 2;
     
     if (out_cache_metas.size() > MAX_SIZE) {
@@ -150,7 +150,7 @@ void TLCacheCache::forget() {
 }
 
 // Cache new objects
-void TLCacheCache::admit(const SimpleRequest &req) {
+void TLCacheNCache::admit(const SimpleRequest &req) {
     const uint64_t &size = req.size;
     if (size > _cacheSize) {
         LOG("L", _cacheSize, req.id, size);
@@ -176,15 +176,15 @@ void TLCacheCache::admit(const SimpleRequest &req) {
         in_cache_metas[pos].status = 0;
     }
     _currentSize += size;
-    if (_currentSize > _cacheSize)
-        is_sampling = true;
+    // if (_currentSize > _cacheSize)
+    //     is_sampling = true;
     while (_currentSize > _cacheSize) { 
         evict();  
     }
 }
 
 // sample eviction candidates
-uint32_t TLCacheCache::rank() {
+uint32_t TLCacheNCache::rank() {
     // 新对象的采样
     vector<uint32_t> sampled_objects;
     uint32_t lenQ = in_cache_metas.size(), idx_row = 0;
@@ -233,7 +233,7 @@ uint32_t TLCacheCache::rank() {
 }
 
 // Sample new objects.
-void TLCacheCache::quick_demotion(vector<uint32_t> &sampled_objects) {
+void TLCacheNCache::quick_demotion(vector<uint32_t> &sampled_objects) {
     if (eviction_counts[2] > 0.01 * Qc * in_cache_metas.size() + 1) { 
         Qc+=1;
         if (hit_distribution[0] + hit_distribution[1] > 1024 && hit_distribution[0] > 0 && hit_distribution[1] > 0) {
@@ -261,14 +261,15 @@ void TLCacheCache::quick_demotion(vector<uint32_t> &sampled_objects) {
 }
 
 // evict an object at a time
-void TLCacheCache::evict() {
+void TLCacheNCache::evict() {
     // get eviction objects
     auto epair = evict_with_distance();
     // evict a object
     evict_with_candidate(epair);
 }
 
-void TLCacheCache::evict_with_candidate(pair<uint64_t, uint32_t> &epair) {
+void TLCacheNCache::evict_with_candidate(pair<uint64_t, uint32_t> &epair) {
+    is_sampling = true;
     Ecounts--;
     uint64_t key = epair.first;
     uint32_t old_pos = epair.second;
@@ -285,7 +286,7 @@ void TLCacheCache::evict_with_candidate(pair<uint64_t, uint32_t> &epair) {
     in_cache_metas.pop_back();
 }
 
-pair<uint64_t, uint32_t> TLCacheCache::evict_with_distance(){
+pair<uint64_t, uint32_t> TLCacheNCache::evict_with_distance(){
     {
         if (!booster) {
             uint32_t pos = _distribution(_generator) % in_cache_metas.size();
@@ -348,7 +349,7 @@ pair<uint64_t, uint32_t> TLCacheCache::evict_with_distance(){
 }
 
 // Predict the eviction candidates.
-void TLCacheCache::prediction(vector<uint32_t> sampled_objects, uint32_t old_objs) {
+void TLCacheNCache::prediction(vector<uint32_t> sampled_objects, uint32_t old_objs) {
     auto timeBegin = chrono::system_clock::now();
     uint32_t sample_nums = sampled_objects.size();
     int32_t indptr[sample_nums + 1];

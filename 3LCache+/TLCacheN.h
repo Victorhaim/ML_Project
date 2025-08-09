@@ -1,5 +1,5 @@
-#ifndef WEBCACHESIM_TLCache_H
-#define WEBCACHESIM_TLCache_H
+#ifndef WEBCACHESIM_TLCacheN_H
+#define WEBCACHESIM_TLCacheN_H
 
 #include "cache.h"
 #include <unordered_map>
@@ -21,7 +21,7 @@ using spp::sparse_hash_map;
 
 #define GROUP_K 16
 
-namespace TLCache {
+namespace TLCacheN {
     static const uint8_t max_n_past_timestamps = 4;
     // Number of  inter-arrival times.
     static const uint8_t max_n_past_distances = 3;
@@ -145,7 +145,7 @@ struct KeyMapEntryT {
     uint32_t list_pos;
 };
 
-class TLCacheCache : public Cache {
+class TLCacheNCache : public Cache {
 public:
     uint64_t current_seq = -1;
     uint32_t n_feature;
@@ -223,7 +223,6 @@ public:
     // random seed
     default_random_engine _generator = default_random_engine();
     uniform_int_distribution<std::size_t> _distribution = uniform_int_distribution<std::size_t>();
-    bool is_sampling = false;
 
     uint64_t byte_million_req;
     void init_with_params(const map<string, string> &params) override {
