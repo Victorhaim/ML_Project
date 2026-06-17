@@ -18,3 +18,5 @@ fig/
 sftp-config.json
 # Clangd cache
 *.cache/
+
+3LCache/scripts/

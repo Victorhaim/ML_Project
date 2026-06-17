@@ -1,0 +1,18 @@
+# Ignore build directory
+_build
+build
+
+# Ignore large trace data - mount this at runtime instead
+data/
+
+# Ignore version control and IDE config
+.git
+.github
+.idea
+.vscode
+*.DS_Store
+
+# Ignore temporary/log files
+*.log
+__pycache__/
+*.pyc
