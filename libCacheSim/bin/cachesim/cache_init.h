@@ -144,6 +144,11 @@ static inline cache_t *create_cache(const char *trace_path, const char *eviction
   } else if (strcasecmp(eviction_algo, "3LCache-OMR") == 0) {
     eviction_params = "objective=object-miss-ratio";
     cache = TLCache_init(cc_params, eviction_params);
+  } else if (strcasecmp(eviction_algo, "3lcache-mab") == 0) {
+    if (eviction_params == NULL) {
+      eviction_params = "objective=byte-miss-ratio,arm_count=4,arm_strategy=position,mab_gamma=0.1";
+    }
+    cache = TLCacheMAB_init(cc_params, eviction_params);
   } else if (strcasecmp(eviction_algo, "3LCache") == 0) {
     eviction_params = "objective=byte-miss-ratio";
     cache = TLCache_init(cc_params, eviction_params);

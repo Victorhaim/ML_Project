@@ -23,6 +23,9 @@ RUN apt update && apt-get install -yqq \
 # Copy the local repository files into the container
 COPY . /3L-Cache
 
+# Install Python requirements
+RUN pip3 install -r /3L-Cache/requirements.txt
+
 # Build and install dependencies (LightGBM, XGBoost, Zstd, etc.)
 WORKDIR /3L-Cache/scripts
 RUN bash ./install_dependency.sh

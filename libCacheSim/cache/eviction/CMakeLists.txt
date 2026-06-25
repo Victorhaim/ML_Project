@@ -92,6 +92,8 @@ endif()
 set (sourceCPP ${sourceCPP} 
     ../../../3LCache/TLCache.cpp
     ../../../3LCache/TLCache_Interface.cpp
+    ../../../3LCache/TLCacheMAB.cpp
+    ../../../3LCache/TLCacheMAB_Interface.cpp
 )
 
 set (sourceCPP ${sourceCPP} 
