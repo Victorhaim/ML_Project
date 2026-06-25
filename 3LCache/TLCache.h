@@ -366,9 +366,9 @@ public:
 
     void erase_out_cache();
 
-    uint32_t rank();
+    virtual uint32_t rank();
 
-    void evict_with_candidate(pair<uint64_t, uint32_t> &epair);
+    virtual void evict_with_candidate(pair<uint64_t, uint32_t> &epair);
 
     vector<uint32_t>  quick_demotion();
 

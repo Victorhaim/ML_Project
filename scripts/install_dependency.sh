@@ -24,7 +24,7 @@ setup_xgboost() {
 	if [[ $GITHUB_ACTIONS == "true" ]]; then
 		make
 	else
-		make -j
+		make -j2
 	fi
 	sudo make install
 }
@@ -40,7 +40,7 @@ setup_zstd() {
     mkdir _build;
     pushd _build/;
     cmake ..
-    make -j
+    make -j2
     sudo make install
 }
 
