@@ -105,7 +105,6 @@ public:
         int32_t counter = indptr.back();
 
         indices.emplace_back(0);
-        // 等待时间
         data.emplace_back(age);
         ++counter;
         int j = 0;
@@ -150,31 +149,43 @@ public:
     uint64_t current_seq = -1;
     uint32_t n_feature;
 
-       // 记录预测结果
+    // --- CDT (Continuous Dynamic Tuning) Integration ---
+    struct CDTArm {
+        double f_val;
+        double Q_val;
+        double mean_reward;
+        int n_pulls;
+        bool active;
+    };
+
+    std::vector<CDTArm> cdt_arms;
+    int cdt_current_arm_idx = -1;
+    int cdt_step_counter = 0;
+    const int CDT_EPOCH_LENGTH = 5000; // Horizon H from the CDT paper
+    const double CDT_TAU = 0.5;        // Sub-Gaussian error parameter (tau_0)
+
+    // CDT Helper Methods
+    double get_clipped_normal_sample();
+    void update_cdt_reward(double reward);
+    void select_next_cdt_arm();
+    // ---------------------------------------------------
+
     vector<vector<pair<double, uint64_t>>> prediction_results;
-    // 记录预测时间
     vector<uint64_t> sample_times;
     uint16_t prediction_idx = 0;
     sparse_hash_map<uint64_t, double> prediction_map;
     uint8_t Q = 10;
-    // 新对象
     deque<uint64_t> Qkeys;
-    // 新对象占用地缓存空间
     uint64_t QSize = 0;
     uint8_t Qc = 1;
-    // 驱逐对象的数量
     int Ecounts = 0;
     uint16_t sample_rate = 2;
-    // 采样指针
     uint32_t samplepointer = -1;
-    // 采样频率
     double f = 0;
     uint64_t eviction_freq[3] = {0, 0, 0};
-    // 窗口大小
     float hsw = 1;
     uint64_t MAX_EVICTION_BOUNDARY[2] = {0, 0};
     uint32_t window_hit[3] = {0, 0, 0};
-    // 两个数分别代表采样边界和时间区间大小
     uint64_t TIME_BOUNDARY = 0;
     uint64_t eviction_counts[3] = {0, 0, 0};
     uint64_t hit_distribution[4] = {0, 0, 0, 0};
@@ -196,10 +207,8 @@ public:
     double training_time = 0;
     double inference_time = 0;
 
-    // Determine whether the model has been trained.
     BoosterHandle booster = nullptr;
 
-    // Model training parameters
     unordered_map<string, string> training_params = {
             {"boosting",         "gbdt"},
             {"objective",        "regression"},
@@ -220,13 +229,11 @@ public:
     };
     ObjectiveT objective = byte_miss_ratio;
 
-    // random seed
     default_random_engine _generator = default_random_engine();
     uniform_int_distribution<std::size_t> _distribution = uniform_int_distribution<std::size_t>();
 
     uint64_t byte_million_req;
     void init_with_params(const map<string, string> &params) override {
-        //set params
         for (auto &it: params) {
             if (it.first == "num_iterations") {
                 training_params["num_iterations"] = it.second;
@@ -295,4 +302,3 @@ public:
 
 }
 #endif
-

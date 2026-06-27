@@ -2,10 +2,99 @@
 #include <algorithm>
 #include "utils.h"
 #include <chrono>
+#include <random>
+#include <cmath>
 
 using namespace chrono;
 using namespace std;
 using namespace TLCacheN;
+
+// ========================================================================
+// CDT (Continuous Dynamic Tuning) Helper Implementations
+// ========================================================================
+static std::mt19937 cdt_gen(1337);
+static std::normal_distribution<double> standard_normal(0.0, 1.0);
+
+// Generate clipped normal sample to prevent underestimation of good arms
+double TLCacheNCache::get_clipped_normal_sample() {
+    double z = standard_normal(cdt_gen);
+    double lower_bound = 1.0 / std::sqrt(2.0 * M_PI);
+    return std::max(lower_bound, z);
+}
+
+// Update the reward for the currently active hyperparameter configuration
+void TLCacheNCache::update_cdt_reward(double reward) {
+    if (cdt_current_arm_idx == -1) return;
+    
+    CDTArm& current_arm = cdt_arms[cdt_current_arm_idx];
+    current_arm.n_pulls += 1;
+    
+    // Online mean update 
+    current_arm.mean_reward = (current_arm.mean_reward * (current_arm.n_pulls - 1) + reward) / current_arm.n_pulls;
+    cdt_step_counter++;
+}
+
+// Zooming TS Algorithm with Restarts 
+void TLCacheNCache::select_next_cdt_arm() {
+    // Restart logic for switching environments 
+    if (cdt_step_counter >= CDT_EPOCH_LENGTH || cdt_arms.empty()) {
+        cdt_arms.clear();
+        cdt_step_counter = 0;
+        
+        // Initialize the space with a random starting point (Activation)
+        std::uniform_real_distribution<double> dist_f(1.0, 50.0);
+        std::uniform_real_distribution<double> dist_q(1.0, 40.0);
+        
+        cdt_arms.push_back({dist_f(cdt_gen), dist_q(cdt_gen), 0.0, 1, true});
+        cdt_current_arm_idx = 0;
+        
+        f = cdt_arms[0].f_val;
+        Q = cdt_arms[0].Q_val;
+        return;
+    }
+
+    double max_I = -1e9;
+    int best_arm_idx = -1;
+    
+    // s_0 parameter: sqrt(52 * pi * tau_0^2 * ln(T))
+    double s_0 = std::sqrt(52.0 * M_PI * (CDT_TAU * CDT_TAU) * std::log(CDT_EPOCH_LENGTH));
+    
+    // Removal and Selection logic
+    for (size_t i = 0; i < cdt_arms.size(); ++i) {
+        if (!cdt_arms[i].active) continue;
+        
+        // Confidence radius calculation r_t(v)
+        double r_t = std::sqrt((13.0 * (CDT_TAU * CDT_TAU) * std::log(CDT_EPOCH_LENGTH)) / (2.0 * cdt_arms[i].n_pulls));
+        
+        // TS standard deviation s_t(v)
+        double s_t = s_0 * std::sqrt(1.0 / cdt_arms[i].n_pulls);
+        
+        // Perturbed estimate I_t(v) 
+        double z_val = get_clipped_normal_sample();
+        double I_t = cdt_arms[i].mean_reward + s_t * z_val;
+        
+        if (I_t > max_I) {
+            max_I = I_t;
+            best_arm_idx = i;
+        }
+    }
+    
+    // Activation logic: randomly explore new regions to cover the space
+    std::uniform_real_distribution<double> rand_prob(0.0, 1.0);
+    if (rand_prob(cdt_gen) < 0.1) { // 10% chance to activate a new arm
+        std::uniform_real_distribution<double> dist_f(1.0, 50.0);
+        std::uniform_real_distribution<double> dist_q(1.0, 40.0);
+        cdt_arms.push_back({dist_f(cdt_gen), dist_q(cdt_gen), 0.0, 1, true});
+        best_arm_idx = cdt_arms.size() - 1;
+    }
+    
+    cdt_current_arm_idx = best_arm_idx;
+    f = cdt_arms[best_arm_idx].f_val;
+    Q = cdt_arms[best_arm_idx].Q_val;
+}
+// ========================================================================
+
+
 // model training
 void TLCacheNCache::train() {
     MAX_EVICTION_BOUNDARY[0] = MAX_EVICTION_BOUNDARY[1];
@@ -87,14 +176,12 @@ void TLCacheNCache::update_stat_periodic() {
 }
 
 bool TLCacheNCache::lookup(const SimpleRequest &req) {
-    // assert(true);
     bool ret;
     ++current_seq;
     auto it = key_map.find(req.id);
     if (it != key_map.end()) {
         auto list_idx = it->second.list_idx;
         auto list_pos = it->second.list_pos;
-        // 找到对应的窗口内的对象请求
         Meta &meta = list_idx == 0 ?  in_cache_metas[list_pos]: out_cache_metas[uint32_t(list_pos - out_sidx)];
         if (is_sampling) 
             get_sample(meta, current_seq, true);
@@ -102,7 +189,6 @@ bool TLCacheNCache::lookup(const SimpleRequest &req) {
             prediction_map.erase(req.id);
             
         if (list_idx) {
-            // 0是新对象
             uint32_t pos = out_cache_metas.size() - uint32_t(list_pos - out_sidx);
             if (pos <= eviction_counts[2]) {
                 if (meta.status == 0) {
@@ -146,7 +232,6 @@ void TLCacheNCache::forget() {
         out_cache_metas.pop_front();
         out_sidx++;
     }
-   
 }
 
 // Cache new objects
@@ -163,8 +248,6 @@ void TLCacheNCache::admit(const SimpleRequest &req) {
         key_map[req.id] = {0, pos};
     } else {
         Meta &meta = out_cache_metas[uint32_t(it->second.list_pos - out_sidx)];
-        // meta.status = 1;
-        // 被驱逐对象中，新对象和旧对象的命中分布
         in_cache_metas.emplace_back(meta);
         meta.status = 2;
         in_cache_metas[pos]._size = size;
@@ -176,8 +259,6 @@ void TLCacheNCache::admit(const SimpleRequest &req) {
         in_cache_metas[pos].status = 0;
     }
     _currentSize += size;
-    // if (_currentSize > _cacheSize)
-    //     is_sampling = true;
     while (_currentSize > _cacheSize) { 
         evict();  
     }
@@ -185,18 +266,23 @@ void TLCacheNCache::admit(const SimpleRequest &req) {
 
 // sample eviction candidates
 uint32_t TLCacheNCache::rank() {
-    // 新对象的采样
     vector<uint32_t> sampled_objects;
     uint32_t lenQ = in_cache_metas.size(), idx_row = 0;
+    
+    // CDT TRIGGER: Dynamic continuous tuning instead of hardcoded heuristics
     if (eviction_freq[0] > 10240) {
-        if (eviction_freq[1] * 1.0 / eviction_freq[0] < 0.9)
-            f *= 0.5;
-        else if (eviction_freq[2] * 1.0 / eviction_freq[0] > 0.9)
-            f *= 2;
-        else
-            f *= 1.1;
+        double current_reward = 0.0;
+        if (eviction_freq[0] > 0) {
+            // Reward is higher when byte miss ratio is lower
+            current_reward = 1.0 - (eviction_freq[1] * 1.0 / eviction_freq[0]); 
+        }
+        
+        update_cdt_reward(current_reward);
+        select_next_cdt_arm(); 
+        
         eviction_freq[0] = 0, eviction_freq[1] = 0, eviction_freq[2] = 0;
     }
+    
     uint32_t old_objs = 0;
     while (idx_row < sample_rate) {
         if (samplepointer >= lenQ) {
@@ -237,11 +323,7 @@ void TLCacheNCache::quick_demotion(vector<uint32_t> &sampled_objects) {
     if (eviction_counts[2] > 0.01 * Qc * in_cache_metas.size() + 1) { 
         Qc+=1;
         if (hit_distribution[0] + hit_distribution[1] > 1024 && hit_distribution[0] > 0 && hit_distribution[1] > 0) {
-            
-            if (hit_distribution[1] * eviction_counts[0] / (hit_distribution[3] * 1.0 / hit_distribution[1]) > hit_distribution[0] * eviction_counts[1] / (hit_distribution[2] * 1.0 / hit_distribution[0]) && Q < 40)
-                Q++;
-            else if (hit_distribution[1] * eviction_counts[0] / (hit_distribution[3] * 1.0 / hit_distribution[1])  < hit_distribution[0] * eviction_counts[1] / (hit_distribution[2] * 1.0 / hit_distribution[0]) && Q > 1)
-                Q--;
+            // CDT already handles Q dynamically
             hit_distribution[0] = 0, hit_distribution[1] = 0, hit_distribution[2] = 0, hit_distribution[3] = 0;
             if (eviction_counts[2] > in_cache_metas.size())
                 eviction_counts[0] = 0, eviction_counts[1] = 0, eviction_counts[2] = 0, Qc = 1;
@@ -262,9 +344,7 @@ void TLCacheNCache::quick_demotion(vector<uint32_t> &sampled_objects) {
 
 // evict an object at a time
 void TLCacheNCache::evict() {
-    // get eviction objects
     auto epair = evict_with_distance();
-    // evict a object
     evict_with_candidate(epair);
 }
 
@@ -366,7 +446,6 @@ void TLCacheNCache::prediction(vector<uint32_t> sampled_objects, uint32_t old_ob
         auto &meta = in_cache_metas[pos];
         keys[idx_row] = meta._key;
         indices[idx_feature] = 0;
-        // 年龄
         data[idx_feature++] = current_seq - meta._past_timestamp;
         uint8_t j = 0;
         uint16_t n_within = meta._freq;
@@ -405,9 +484,7 @@ void TLCacheNCache::prediction(vector<uint32_t> sampled_objects, uint32_t old_ob
                               scores);
     
     double _distance;
-    // 新对象
     vector<pair<double, uint64_t>> prediction_result;
-    // 旧对象
     vector<pair<double, uint64_t>> new_prediction_result;
     if (objective == byte_miss_ratio) {
         for (int i = 0; i < sample_nums; ++i) {
@@ -429,12 +506,11 @@ void TLCacheNCache::prediction(vector<uint32_t> sampled_objects, uint32_t old_ob
         }
     }
     
-    // 排序
     sort(prediction_result.begin(), prediction_result.end(), [](const auto& a, const auto& b) {
-        return a.first < b.first; // 按第一个元素升序
+        return a.first < b.first; 
     });
     sort(new_prediction_result.begin(), new_prediction_result.end(), [](const auto& a, const auto& b) {
-        return a.first < b.first; // 按第一个元素升序
+        return a.first < b.first; 
     });
 
     prediction_results[prediction_idx] = prediction_result;
@@ -444,4 +520,3 @@ void TLCacheNCache::prediction(vector<uint32_t> sampled_objects, uint32_t old_ob
     prediction_idx = prediction_idx % GROUP_K;
     inference_time += chrono::duration_cast<chrono::microseconds>(chrono::system_clock::now() - timeBegin).count();
 }
-
