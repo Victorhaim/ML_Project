@@ -60,15 +60,15 @@ if __name__ == "__main__":
                 file_list.append(folder_path + file_name)
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
         for file, sizes in zip(file_list, csizes):
-            cache_strategy = ['gdsf', 'tinylfu', 'arc', '3lcache', 'lecar', 'lhd', 'sieve', 'cacheus', 's3fifo', 'lru']
+            cache_strategy = ['gdsf', 'tinylfu', 'arc', '3lcache', '3lcacheql', 'lecar', 'lhd', 'sieve', 'cacheus', 's3fifo', 'lru']
             for cs in cache_strategy:
                 file_type = file.split('.')[-1]
                 command = f'../../_build/bin/cachesim {file} {file_type} {cs} {",".join([str(size) for size in sizes])} --num-thread=2 -t "time-col=1, obj-id-col=2, obj-size-col=3, has-header=false, obj-id-is-num=true"'
-                executor.submit(lib_command_executor, command) 
-                
+                executor.submit(lib_command_executor, command)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
         for file, sizes in zip(file_list, csizes):
-            cache_strategy = ['gdsf', 'tinylfu', 'arc', '3lcache', 'lecar', 'lhd', 'sieve', 'cacheus', 's3fifo', 'lru']
+            cache_strategy = ['gdsf', 'tinylfu', 'arc', '3lcache', '3lcacheql', 'lecar', 'lhd', 'sieve', 'cacheus', 's3fifo', 'lru']
             for cs in cache_strategy:
                 for size in sizes:
                     file_type = file.split('.')[-1]

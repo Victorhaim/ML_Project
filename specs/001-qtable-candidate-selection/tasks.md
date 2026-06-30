@@ -19,8 +19,8 @@
 
 **Purpose**: Create the new variant's directory and wire it into the build system.
 
-- [ ] T001 Create `3LCacheQL/` directory at repository root
-- [ ] T002 Add `file(GLOB TLCacheQL_source ./3LCacheQL/*.cpp)` and `set(cache_source ${cache_source} ${TLCacheQL_source})` to `CMakeLists.txt` after the existing TLCache glob block (line ~329)
+- [x] T001 Create `3LCacheQL/` directory at repository root
+- [x] T002 Add `file(GLOB TLCacheQL_source ./3LCacheQL/*.cpp)` and `set(cache_source ${cache_source} ${TLCacheQL_source})` to `CMakeLists.txt` after the existing TLCache glob block (line ~329)
 
 **Checkpoint**: `3LCacheQL/` directory exists; CMakeLists.txt will compile any `.cpp` files placed there.
 
@@ -32,7 +32,7 @@
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete.
 
-- [ ] T003 Write `3LCacheQL/TLCacheQL.h` — declare `PendingUpdate` struct and `TLCacheQLCache` class inheriting from `TLCache::TLCacheCache`, with fields `q_table` (`unordered_map<uint32_t, array<float,2>>`), `pending_updates` (`unordered_map<uint64_t, PendingUpdate>`), `q_alpha` (float, default 0.1), `q_epsilon` (float, default 0.1), `q_table_updates` (uint64_t); declare overrides `init_with_params`, `lookup`, `rank`, `update_stat_periodic`; declare private helpers `encode_state` and `apply_reward`; include `"../3LCache/TLCache.h"`
+- [x] T003 Write `3LCacheQL/TLCacheQL.h` — declare `PendingUpdate` struct and `TLCacheQLCache` class inheriting from `TLCache::TLCacheCache`, with fields `q_table` (`unordered_map<uint32_t, array<float,2>>`), `pending_updates` (`unordered_map<uint64_t, PendingUpdate>`), `q_alpha` (float, default 0.1), `q_epsilon` (float, default 0.1), `q_table_updates` (uint64_t); declare overrides `init_with_params`, `lookup`, `rank`, `update_stat_periodic`; declare private helpers `encode_state` and `apply_reward`; include `"../3LCache/TLCache.h"`
 
 **Checkpoint**: Foundation ready — `TLCacheQL.h` compiles cleanly when included.
 
@@ -46,9 +46,9 @@
 
 ### Implementation for User Story 1
 
-- [ ] T004 [US1] Implement `3LCacheQL/TLCacheQL_Interface.cpp` — full libCacheSim C adapter following the pattern in `3LCache/TLCache_Interface.cpp`: define `TLCacheQL_params_t`, implement `TLCacheQL_init` (calls `cache_struct_init("TLCacheQL", ...)`, sets all `cache_t` function pointers, sets `cache_name` to `"TLCacheQL-BMR"` or `"TLCacheQL-OMR"` per objective), `TLCacheQL_free`, `TLCacheQL_get` (delegates to `cache_get_base`), `TLCacheQL_find`, `TLCacheQL_insert`, `TLCacheQL_evict`, `TLCacheQL_to_evict`, `TLCacheQL_remove`, `TLCacheQL_get_occupied_byte`, `TLCacheQL_get_n_obj`, `TLCacheQL_parse_params` (accepts same params as TLCache plus `q_alpha` and `q_epsilon`)
+- [x] T004 [US1] Implement `3LCacheQL/TLCacheQL_Interface.cpp` — full libCacheSim C adapter following the pattern in `3LCache/TLCache_Interface.cpp`: define `TLCacheQL_params_t`, implement `TLCacheQL_init` (calls `cache_struct_init("TLCacheQL", ...)`, sets all `cache_t` function pointers, sets `cache_name` to `"TLCacheQL-BMR"` or `"TLCacheQL-OMR"` per objective), `TLCacheQL_free`, `TLCacheQL_get` (delegates to `cache_get_base`), `TLCacheQL_find`, `TLCacheQL_insert`, `TLCacheQL_evict`, `TLCacheQL_to_evict`, `TLCacheQL_remove`, `TLCacheQL_get_occupied_byte`, `TLCacheQL_get_n_obj`, `TLCacheQL_parse_params` (accepts same params as TLCache plus `q_alpha` and `q_epsilon`)
 
-- [ ] T005 [US1] Implement `3LCacheQL/TLCacheQL.cpp` — `init_with_params()` override: call `TLCacheCache::init_with_params(params)`, then parse `q_alpha` and `q_epsilon` from the params map; implement `rank()` override as a cold-start stub that always calls and returns `TLCacheCache::rank()` (full Q-table logic added in Phase 4); implement `update_stat_periodic()` override that calls the base and logs `q_table_updates` to stderr
+- [x] T005 [US1] Implement `3LCacheQL/TLCacheQL.cpp` — `init_with_params()` override: call `TLCacheCache::init_with_params(params)`, then parse `q_alpha` and `q_epsilon` from the params map; implement `rank()` override as a cold-start stub that always calls and returns `TLCacheCache::rank()` (full Q-table logic added in Phase 4); implement `update_stat_periodic()` override that calls the base and logs `q_table_updates` to stderr
 
 - [ ] T006 [US1] Build the project inside Docker (`sudo docker build -t 3lcache -f dockerfile . && sudo docker run ... cmake .. && make -j$(nproc)`) and confirm `_build/bin/cachesim` is produced without errors; fix any compile errors in `3LCacheQL/` before proceeding
 
@@ -64,15 +64,15 @@
 
 ### Implementation for User Story 2
 
-- [ ] T007 [US2] Implement `encode_state(const Meta& meta) const` in `3LCacheQL/TLCacheQL.cpp` — compute `freq_bucket = min(7, (uint8_t)floor(log2(meta._freq)))`, `age_bucket = min(7, (uint8_t)(8 * (current_seq - meta._past_timestamp) / (initial_queue_length + 1)))`, `size_bucket = min(7, (uint8_t)floor(log2(meta._size / 1024 + 1)))`; return `(freq_bucket << 6) | (age_bucket << 3) | size_bucket` as `uint32_t`
+- [x] T007 [US2] Implement `encode_state(const Meta& meta) const` in `3LCacheQL/TLCacheQL.cpp` — compute `freq_bucket = min(7, (uint8_t)floor(log2(meta._freq)))`, `age_bucket = min(7, (uint8_t)(8 * (current_seq - meta._past_timestamp) / (initial_queue_length + 1)))`, `size_bucket = min(7, (uint8_t)floor(log2(meta._size / 1024 + 1)))`; return `(freq_bucket << 6) | (age_bucket << 3) | size_bucket` as `uint32_t`
 
-- [ ] T008 [US2] Replace the `rank()` stub in `3LCacheQL/TLCacheQL.cpp` with the full Q-table implementation: (1) cold-start guard — if `!booster`, call and return `TLCacheCache::rank()`; (2) call `quick_demotion()` (inherited); (3) walk cache queue from `samplepointer` for up to `sample_rate` steps — for each object call `encode_state`, look up `q_table` (default `{0,0}` if missing), apply ε-greedy (with prob `q_epsilon` choose random action, else choose action with higher Q-value), if action = nominate add pos to `sampled_objects`, advance `samplepointer` with wraparound; (4) fallback: if `sampled_objects` is empty, force-add `in_cache.q.head`; (5) call `prediction(sampled_objects)` (inherited); (6) return `sampled_objects.size()`
+- [x] T008 [US2] Replace the `rank()` stub in `3LCacheQL/TLCacheQL.cpp` with the full Q-table implementation: (1) cold-start guard — if `!booster`, call and return `TLCacheCache::rank()`; (2) call `quick_demotion()` (inherited); (3) walk cache queue from `samplepointer` for up to `sample_rate` steps — for each object call `encode_state`, look up `q_table` (default `{0,0}` if missing), apply ε-greedy (with prob `q_epsilon` choose random action, else choose action with higher Q-value), if action = nominate add pos to `sampled_objects`, advance `samplepointer` with wraparound; (4) fallback: if `sampled_objects` is empty, force-add `in_cache.q.head`; (5) call `prediction(sampled_objects)` (inherited); (6) return `sampled_objects.size()`
 
-- [ ] T009 [US2] Implement `apply_reward(uint64_t key, float reward)` in `3LCacheQL/TLCacheQL.cpp` — look up `pending_updates[key]`, retrieve `{state, action}`, apply `q_table[state][action] = (1 - q_alpha) * q_table[state][action] + q_alpha * reward`, increment `q_table_updates`, erase `pending_updates[key]`
+- [x] T009 [US2] Implement `apply_reward(uint64_t key, float reward)` in `3LCacheQL/TLCacheQL.cpp` — look up `pending_updates[key]`, retrieve `{state, action}`, apply `q_table[state][action] = (1 - q_alpha) * q_table[state][action] + q_alpha * reward`, increment `q_table_updates`, erase `pending_updates[key]`
 
-- [ ] T010 [US2] Implement `lookup()` override in `3LCacheQL/TLCacheQL.cpp` — call `TLCacheCache::lookup(req)`, then check if `key_map.count(req.id) && key_map[req.id].list_idx == 1` (object in `out_cache`, i.e., re-request of evicted object) and `pending_updates.count(req.id)` — if both true, call `apply_reward(req.id, -1.0f)`; return the base result; also, when an object is evicted (detected by intercepting after `evict_with_candidate` — add a hook to `admit()` or override the eviction path): create a `PendingUpdate{encode_state(meta_at_eviction_time), 1}` entry in `pending_updates` keyed by the evicted object's key
+- [x] T010 [US2] Implement `lookup()` override in `3LCacheQL/TLCacheQL.cpp` — call `TLCacheCache::lookup(req)`, then check if `key_map.count(req.id) && key_map[req.id].list_idx == 1` (object in `out_cache`, i.e., re-request of evicted object) and `pending_updates.count(req.id)` — if both true, call `apply_reward(req.id, -1.0f)`; return the base result; also, when an object is evicted (detected by intercepting after `evict_with_candidate` — add a hook to `admit()` or override the eviction path): create a `PendingUpdate{encode_state(meta_at_eviction_time), 1}` entry in `pending_updates` keyed by the evicted object's key
 
-- [ ] T011 [US2] Implement positive reward on `out_cache` age-out in `3LCacheQL/TLCacheQL.cpp` — override `erase_out_cache()` or hook into `admit()` where `out_cache` is trimmed: after `TLCacheCache::erase_out_cache()` is called (or the equivalent trim logic), for any key removed from `out_cache` that still has a `pending_updates` entry, call `apply_reward(key, +1.0f)`; note: examine `TLCache.cpp::erase_out_cache()` to understand the trim trigger and replicate the hook correctly
+- [x] T011 [US2] Implement positive reward on `out_cache` age-out in `3LCacheQL/TLCacheQL.cpp` — override `erase_out_cache()` or hook into `admit()` where `out_cache` is trimmed: after `TLCacheCache::erase_out_cache()` is called (or the equivalent trim logic), for any key removed from `out_cache` that still has a `pending_updates` entry, call `apply_reward(key, +1.0f)`; note: examine `TLCache.cpp::erase_out_cache()` to understand the trim trigger and replicate the hook correctly
 
 **Checkpoint**: US2 complete — Q-table updates accumulate during a long trace run, candidate selection is driven by the Q-table, inherited GBM predictor still ranks the nominated candidates, and the cold-start fallback works on a fresh cache.
 
@@ -86,11 +86,11 @@
 
 ### Implementation for User Story 3
 
-- [ ] T012 [P] [US3] Add `"3lcacheql"` to both `cache_strategy` lists in `3LCache/scripts/executor_libcachesim.py` (lines 63 and 71)
+- [x] T012 [P] [US3] Add `"3lcacheql"` to both `cache_strategy` lists in `3LCache/scripts/executor_libcachesim.py` (lines 63 and 71)
 
-- [ ] T013 [P] [US3] Add `elif algo[:9] == 'TLCacheQL': key_map[algo] = '3L-Cache-QL'` to the algorithm name-mapping block in `3LCache/scripts/miss_ratio_boxplot.py` (after the existing `TLCache` mapping at line ~108)
+- [x] T013 [P] [US3] Add `elif algo[:9] == 'TLCacheQL': key_map[algo] = '3L-Cache-QL'` to the algorithm name-mapping block in `3LCache/scripts/miss_ratio_boxplot.py` (after the existing `TLCache` mapping at line ~108)
 
-- [ ] T014 [P] [US3] Add `elif algo[:9] == 'TLCacheQL': key_map[algo] = '3L-Cache-QL'` to the equivalent algorithm name-mapping block in `3LCache/scripts/cpu_overhead_boxplot.py` (if a mapping block exists; otherwise add the entry inline in the plot label logic)
+- [x] T014 [P] [US3] Add `elif algo[:9] == 'TLCacheQL': key_map[algo] = '3L-Cache-QL'` to the equivalent algorithm name-mapping block in `3LCache/scripts/cpu_overhead_boxplot.py` (if a mapping block exists; otherwise add the entry inline in the plot label logic)
 
 **Checkpoint**: US3 complete — running `miss_ratio_boxplot.py` and `cpu_overhead_boxplot.py` with `"3lcacheql"` included produces figures and result files that include `3L-Cache-QL`.
 

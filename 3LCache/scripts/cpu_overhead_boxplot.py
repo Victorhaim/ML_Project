@@ -92,6 +92,8 @@ def draw_box_plot(algorithms, df, ax1, ax2, cnt, fontsize=40):
     for algo in algorithms:
         if algo[:3] == 'LRB':
             key_map[algo] = 'LRB'
+        elif algo[:9] == 'TLCacheQL':
+            key_map[algo] = '3L-Cache-QL'
         elif algo[:7] == 'TLCache':
             key_map[algo] = '3L-Cache'
         elif algo[:7] == 'Cacheus':

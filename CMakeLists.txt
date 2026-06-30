@@ -332,6 +332,12 @@ set (cache_source
         ${cache_source} ${TLCache_source}
 )
 
+file(GLOB TLCacheQL_source
+        ./3LCacheQL/*.cpp)
+set (cache_source
+        ${cache_source} ${TLCacheQL_source}
+)
+
 set(reader_source
     ${PROJECT_SOURCE_DIR}/libCacheSim/traceReader/reader.c
     ${PROJECT_SOURCE_DIR}/libCacheSim/traceReader/generalReader/binary.c
