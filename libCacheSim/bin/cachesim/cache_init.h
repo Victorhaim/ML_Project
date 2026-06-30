@@ -147,6 +147,8 @@ static inline cache_t *create_cache(const char *trace_path, const char *eviction
   } else if (strcasecmp(eviction_algo, "3LCache") == 0) {
     eviction_params = "objective=byte-miss-ratio";
     cache = TLCache_init(cc_params, eviction_params);
+  } else if (strcasecmp(eviction_algo, "3lcacheql") == 0 || strcasecmp(eviction_algo, "3LCacheQL") == 0) {
+    cache = TLCacheQL_init(cc_params, eviction_params);
 #ifdef ENABLE_GLCACHE
   } else if (strcasecmp(eviction_algo, "GLCache") == 0 || strcasecmp(eviction_algo, "gl-cache") == 0) {
     cache = GLCache_init(cc_params, eviction_params);

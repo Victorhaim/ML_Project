@@ -227,6 +227,10 @@ if __name__ == "__main__":
             algorithms.append('FIFO')
         elif cs.lower() == 'glcache':
             algorithms.append('GLCache')
+        elif cs.lower() == '3lcacheql':
+            algorithms.append('TLCacheQL-BMR')
+        elif cs.lower() == 'lrb':
+            algorithms.append('LRB-BMR')
     # algorithms = ['LHD', 'GDSF', 'ARC', 'Sieve', 'S3FIFO-0.1000-2', 'WTinyLFU-w0.01-SLRU', 'LeCaR', 'Cacheus', 'TLCache-BMR', 'LRU']  
     small_cache_sizes = []
     large_cache_sizes = []
@@ -234,6 +238,7 @@ if __name__ == "__main__":
         small_cache_sizes.append(cs[0])
         large_cache_sizes.append(cs[1])
     
+    os.makedirs('./figures', exist_ok=True)
     plt.figure(figsize=(16, 9))
     xlabels = ['Small cache size', 'Large cache size']
     if args.metric == "bmr":
@@ -243,7 +248,8 @@ if __name__ == "__main__":
     for i, xlabel in enumerate(xlabels):
         if benchmark_algo not in algorithms:
             algorithms.append(benchmark_algo)
-        results = get_mr_result(file_list, small_cache_sizes, algorithms, args.metric)
+        csizes_for_iter = small_cache_sizes if i == 0 else large_cache_sizes
+        results = get_mr_result(file_list, csizes_for_iter, algorithms, args.metric)
         print(results)
         df = pd.DataFrame(results[1:], columns=results[0])
         print(df)

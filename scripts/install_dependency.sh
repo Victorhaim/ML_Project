@@ -63,10 +63,6 @@ else
 	setup_centos
 fi  
 
-if [[ ! $GITHUB_ACTIONS == "true" ]]; then
-	setup_xgboost
-	# setup_lightgbm
-fi
 setup_zstd
 
 cd $CURR_DIR
