@@ -1,81 +1,144 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR/_build/bin"
+cd "$SCRIPT_DIR"
 
 DATA_DIR="$SCRIPT_DIR/data"
-TRACE_PARAMS="time-col=1,obj-id-is-num=true,obj-id-col=2,obj-size-col=3"
-CACHE_SIZES="16MB 32MB 64MB 128MB 256MB 512MB"
-MAB_PARAMS="arm_count=5,arm_strategy=frequency,mab_gamma=0.03"
+INTERMEDIATE_DIR="$SCRIPT_DIR/intermediate-results"
 
-# איסוף רשימת הטרייסים לפעולה
-if [ "$#" -ge 1 ]; then
-    TRACES=("$@")
-else
-    TRACES=()
-    for f in "$DATA_DIR"/*.csv; do
-        [ -e "$f" ] || continue
-        if [[ "$(basename "$f")" == *".sample.csv"* ]]; then continue; fi
-        TRACES+=("$(basename "$f")")
-    done
-fi
+# 1. תיקון מיפוי העמודות (2 ו-3) ושימוש במקפים (-) עבור MAB
+TRACE_PARAMS="time-col=1,obj-id-is-num=true,obj-id-col=2,obj-size-col=3"
+CACHE_SIZES="16MB 32MB 64MB"
+MAB_PARAMS="arm-count=5,arm-strategy=frequency,mab-gamma=0.03"
+
+# איסוף רשימת הטרייסים לטסט (ללא msr_data וללא sample)
+TEST_TRACES=()
+shopt -s globstar nullglob
+for f in "$DATA_DIR"/**/*.csv; do
+    [ -e "$f" ] || continue
+    case "$f" in
+        *"/msr_data/"* ) continue ;;
+    esac
+    base="$(basename "$f")"
+    [[ "$base" == *".sample.csv"* ]] && continue
+    TEST_TRACES+=("$f")
+done
 
 LOG_OUTPUT_DIR="$SCRIPT_DIR/cdt_logs"
 mkdir -p "$LOG_OUTPUT_DIR"
 CENTRAL_LOG="$LOG_OUTPUT_DIR/simulation_comparison.log"
 
 # אתחול קובץ הלוג המרכזי
-echo "==========================================================" > "$CENTRAL_LOG"
-echo "📝 3LCache Original vs Victor EXP3 MAB Text Log 📝" >> "$CENTRAL_LOG"
-echo "Execution Timestamp: $(date)" >> "$CENTRAL_LOG"
-echo "==========================================================" >> "$CENTRAL_LOG"
-echo "" >> "$CENTRAL_LOG"
+cat << EOF > "$CENTRAL_LOG"
+==========================================================
+📝 3LCache Baseline vs Victor EXP3 MAB (Test Mode) Log 📝
+Execution Timestamp: $(date)
+==========================================================
 
-echo "Running Experiments: 3LCache Baseline vs Victor MAB"
-echo "MAB config: $MAB_PARAMS"
-echo "Traces: ${#TRACES[@]}"
+EOF
+
+echo "🚀 Running Test Experiments: 3LCache Baseline vs Victor MAB (Trained Policy)"
+echo "⚙️ MAB config: $MAB_PARAMS"
+echo "📁 Traces: ${#TEST_TRACES[@]}"
 echo ""
 
 TOTAL_MAB_WINS=0
 TOTAL_BASE_WINS=0
 TOTAL_TIES=0
 
-for TRACE_NAME in "${TRACES[@]}"; do
-    TRACE="$DATA_DIR/$TRACE_NAME"
+# מנגנון ניקוי בטוח לקבצים זמניים
+TMP_BASE=""
+TMP_MAB=""
+cleanup() {
+    [ -n "$TMP_BASE" ] && rm -f "$TMP_BASE" "${TMP_BASE}.cachesim" "${TMP_BASE}.parse" 2>/dev/null || true
+    [ -n "$TMP_MAB" ] && rm -f "$TMP_MAB" "${TMP_MAB}.cachesim" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+for TRACE in "${TEST_TRACES[@]}"; do
+    TRACE_NAME="$(basename "$TRACE")"
     if [ ! -f "$TRACE" ]; then
-        echo "Skipping $TRACE_NAME (not found)"
+        echo "⚠️ Skipping $TRACE_NAME (not found)"
         continue
     fi
 
-    echo "=== $TRACE_NAME ==="
-    echo "| Cache Size | 3LCache Baseline | Victor MAB | Diff (MAB - Base) | Winner |"
+    echo "=== 📂 $TRACE_NAME ==="
+    echo "| Cache Size | 3LCache Baseline | Victor MAB (Test) | Diff (MAB - Base) | Winner |"
     echo "| --- | --- | --- | --- | --- |"
 
     TRACE_MAB_WINS=0
     TRACE_BASE_WINS=0
 
     for CACHE_SIZE in $CACHE_SIZES; do
+        POLICY_FILE="$INTERMEDIATE_DIR/meta-policy-${CACHE_SIZE}.txt"
+        CONFIG_FILE="$INTERMEDIATE_DIR/profiler-config-${CACHE_SIZE}.txt"
+
+        if [ ! -f "$POLICY_FILE" ]; then
+            echo "| $CACHE_SIZE | MISSING POLICY | MISSING POLICY | - | SKIP |"
+            continue
+        fi
+
         TMP_BASE=$(mktemp)
         TMP_MAB=$(mktemp)
 
-        # שימוש בשמות המקוריים הרשומים בבנייה של הסימולטור שלכם
-        ./cachesim "$TRACE" csv 3LCache "$CACHE_SIZE" -t "$TRACE_PARAMS" > "$TMP_BASE" 2>&1 || true
-        ./cachesim "$TRACE" csv 3lcache-mab "$CACHE_SIZE" -t "$TRACE_PARAMS" -e "$MAB_PARAMS" > "$TMP_MAB" 2>&1 || true
+        # 1. הרצת Baseline (3lcache מקורי)
+        rm -f "$(basename "$TRACE").cachesim" || true
+        "./_build/bin/cachesim" "$TRACE" csv 3lcache "$CACHE_SIZE" -t "$TRACE_PARAMS" > "$TMP_BASE" 2>&1 || true
+        
+        OUTFILE_BASE="$(basename "$TRACE").cachesim"
+        if [ -f "$OUTFILE_BASE" ]; then
+            cp "$OUTFILE_BASE" "${TMP_BASE}.cachesim" || true
+            echo "[INFO] saved baseline ofile: ${TMP_BASE}.cachesim" >> "$CENTRAL_LOG"
+        fi
 
-        # חילוץ מתמטי של מדד הפספוסים האמיתי והסופי
-        BASE_RES=$(awk '/miss ratio/ { for (i=1; i<=NF; i++) if ($(i) ~ /ratio/) { val=$(i+1); gsub(/[^0-9.]/, "", val); if (val!="") final_val=val } } END { print final_val }' "$TMP_BASE")
-        MAB_RES=$(awk '/miss ratio/ { for (i=1; i<=NF; i++) if ($(i) ~ /ratio/) { val=$(i+1); gsub(/[^0-9.]/, "", val); if (val!="") final_val=val } } END { print final_val }' "$TMP_MAB")
+        # 2. הרצת Victor MAB במצב TEST עם מקפים תקינים בפרמטרים
+        rm -f "$(basename "$TRACE").cachesim" || true
+        "./_build/bin/cachesim" "$TRACE" csv 3lcache-mab "$CACHE_SIZE" \
+            -t "$TRACE_PARAMS" \
+            -e "${MAB_PARAMS},profiler-mode=test,policy-file=${POLICY_FILE},config-file=${CONFIG_FILE}" \
+            > "$TMP_MAB" 2>&1 || true
+            
+        OUTFILE_MAB="$(basename "$TRACE").cachesim"
+        if [ -f "$OUTFILE_MAB" ]; then
+            cp "$OUTFILE_MAB" "${TMP_MAB}.cachesim" || true
+            echo "[INFO] saved MAB ofile: ${TMP_MAB}.cachesim" >> "$CENTRAL_LOG"
+        fi
 
-        if [ -z "$BASE_RES" ] || [ -z "$MAB_RES" ] || [ "$BASE_RES" = "" ] || [ "$MAB_RES" = "" ]; then
+        # פונקציית חילוץ מבוססת Regex חסינה
+        extract_miss_by_kind() {
+            local f="$1"; local size_mb="$2"; local kind="$3"
+            if [ "$kind" = "mab" ]; then
+                grep -iE "MAB.*cache size[[:space:]]+${size_mb}MiB" "$f" 2>/dev/null | tail -n1 | sed -n 's/.*miss ratio[^0-9]*\([0-9.]*\).*/\1/p' || true
+            else
+                grep -iE "cache size[[:space:]]+${size_mb}MiB" "$f" 2>/dev/null | grep -iv "MAB" | tail -n1 | sed -n 's/.*miss ratio[^0-9]*\([0-9.]*\).*/\1/p' || true
+            fi
+        }
+
+        # חילוץ תוצאות
+        BASE_RES=$(extract_miss_by_kind "${TMP_BASE}.cachesim" "${CACHE_SIZE%MB}" "base")
+        [ -z "$BASE_RES" ] && BASE_RES=$(extract_miss_by_kind "$TMP_BASE" "${CACHE_SIZE%MB}" "base")
+
+        MAB_RES=$(extract_miss_by_kind "${TMP_MAB}.cachesim" "${CACHE_SIZE%MB}" "mab")
+        [ -z "$MAB_RES" ] && MAB_RES=$(extract_miss_by_kind "$TMP_MAB" "${CACHE_SIZE%MB}" "mab")
+
+        # בדיקת אפסים תקינה מתמטית (אם שניהם 0.0000)
+        IS_ZERO=$(awk -v a="$BASE_RES" -v b="$MAB_RES" 'BEGIN { if (a+0 == 0 && b+0 == 0) print 1; else print 0 }')
+        if [ "$IS_ZERO" = "1" ]; then
+            echo "[WARN] both miss ratios are 0. Running parse diagnostic for $TRACE_NAME $CACHE_SIZE" >> "$CENTRAL_LOG"
+            "./_build/bin/cachesim" "$TRACE" csv 3lcache "$CACHE_SIZE" -t "$TRACE_PARAMS" -e "print" > "${TMP_BASE}.parse" 2>&1 || true
+            head -n 40 "${TMP_BASE}.parse" >> "$CENTRAL_LOG" || true
+        fi
+
+        if [ -z "$BASE_RES" ] || [ -z "$MAB_RES" ]; then
             echo "| $CACHE_SIZE | ERROR | ERROR | - | - |"
-            rm -f "$TMP_BASE" "$TMP_MAB"
+            cleanup
             continue
         fi
 
         # חישוב הפערים וקביעת המנצח
         DIFF=$(awk -v a="$MAB_RES" -v b="$BASE_RES" 'BEGIN { printf "%.4f", a - b }')
-        SIGN=$(awk -v d="$DIFF" 'BEGIN { if (d + 0 < -0.00001) print -1; else if (d + 0 > 0.00001) print 1; else print 0 }')
+        SIGN=$(awk -v d="$DIFF" 'BEGIN { if (d + 0 < -0.0001) print -1; else if (d + 0 > 0.0001) print 1; else print 0 }')
 
         if [ "$SIGN" = "-1" ]; then
             WINNER="MAB 🏆"
@@ -93,33 +156,33 @@ for TRACE_NAME in "${TRACES[@]}"; do
         echo "| $CACHE_SIZE | $BASE_RES | $MAB_RES | $DIFF | $WINNER |"
 
         # כתיבת מקטעי הזמן לתוך הלוג המרכזי
-        echo "========================================================" >> "$CENTRAL_LOG"
-        echo "📦 CACHE SIZE: $CACHE_SIZE | TRACE: $TRACE_NAME" >> "$CENTRAL_LOG"
-        echo "📊 Final Miss Ratio -> Baseline: $BASE_RES | Victor MAB: $MAB_RES" >> "$CENTRAL_LOG"
-        echo "========================================================" >> "$CENTRAL_LOG"
-        
-        echo "--- 🔴 ORIGINAL 3LCACHE TIMELINE ---" >> "$CENTRAL_LOG"
-        grep "\[Baseline\]" "$TMP_BASE" >> "$CENTRAL_LOG" || true
-        echo "" >> "$CENTRAL_LOG"
+        {
+            echo "========================================================"
+            echo "📦 CACHE SIZE: $CACHE_SIZE | TRACE: $TRACE_NAME"
+            echo "📊 Final Miss Ratio -> Baseline: $BASE_RES | Victor MAB: $MAB_RES"
+            echo "========================================================"
+            echo "--- 🔴 ORIGINAL 3LCACHE TIMELINE ---"
+            grep "\[Baseline\]" "$TMP_BASE" || true
+            echo ""
+            echo "--- 🔵 VICTOR EXP3 MAB TIMELINE ---"
+            grep -E "\[Victor MAB\]|\[Test\]" "$TMP_MAB" || true
+            echo ""
+            echo "--------------------------------------------------------"
+            echo ""
+        } >> "$CENTRAL_LOG"
 
-        echo "--- 🔵 VICTOR EXP3 MAB TIMELINE ---" >> "$CENTRAL_LOG"
-        grep "\[Victor MAB\]" "$TMP_MAB" >> "$CENTRAL_LOG" || true
-        echo "" >> "$CENTRAL_LOG"
-        echo "--------------------------------------------------------" >> "$CENTRAL_LOG"
-        echo "" >> "$CENTRAL_LOG"
-
-        rm -f "$TMP_BASE" "$TMP_MAB"
+        cleanup
     done
 
-    echo "  -> MAB wins: $TRACE_MAB_WINS / 6, Baseline wins: $TRACE_BASE_WINS / 6"
+    echo "  -> Summary: MAB wins $TRACE_MAB_WINS / 3, Baseline wins $TRACE_BASE_WINS / 3"
     echo ""
 done
 
 TOTAL=$((TOTAL_MAB_WINS + TOTAL_BASE_WINS + TOTAL_TIES))
 echo "============================================"
-echo "OVERALL SUMMARY (across all traces and sizes)"
-echo "  MAB wins:      $TOTAL_MAB_WINS / $TOTAL"
-echo "  Baseline wins: $TOTAL_BASE_WINS / $TOTAL"
-echo "  Ties:          $TOTAL_TIES / $TOTAL"
+echo "📊 OVERALL SUMMARY (across all test traces and sizes)"
+echo "   MAB wins:      $TOTAL_MAB_WINS / $TOTAL"
+echo "   Baseline wins: $TOTAL_BASE_WINS / $TOTAL"
+echo "   Ties:          $TOTAL_TIES / $TOTAL"
 echo "============================================"
-echo "✅ הניסוי הסתיים בהצלחה! קובץ הטקסט המרכזי מוכן בנתיב: cdt_logs/simulation_comparison.log"
+echo "✅ התהליך הסתיים בהצלחה! הלוג המרכזי מוכן בנתיב: $CENTRAL_LOG"

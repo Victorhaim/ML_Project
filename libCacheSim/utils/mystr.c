@@ -56,6 +56,22 @@ char *replace_char(char *str, char find, char replace) {
   return str;
 }
 
+char *replace_underscores_in_param_keys(char *str) {
+  if (str == NULL) return str;
+  char *rest = str;
+  while (rest != NULL && *rest != '\0') {
+    char *eq = strchr(rest, '=');
+    if (eq == NULL) break;
+    for (char *p = rest; p < eq; p++) {
+      if (*p == '_') *p = '-';
+    }
+    char *comma = strchr(eq, ',');
+    if (comma == NULL) break;
+    rest = comma + 1;
+  }
+  return str;
+}
+
 const char *mybasename(char const *path) {
   char *s = strrchr(path, '/');
   if (!s)

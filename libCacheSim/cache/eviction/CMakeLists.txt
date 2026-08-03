@@ -80,21 +80,19 @@ set(sourceCPP
         cpp/GDSF.cpp
         LHD/lhd.cpp
         LHD/LHD_Interface.cpp
+        ../../../3LCache/TLCache.cpp
+        ../../../3LCache/TLCache_Interface.cpp
+        ../../../3LCache/TLCacheMAB.cpp
+        ../../../3LCache/TLCacheMAB_Interface.cpp
+        cpp/WorkloadProfiler.cpp
         )
 
 if (ENABLE_LRB)
     set (sourceCPP ${sourceCPP} 
         LRB/lrb.cpp
         LRB/LRB_Interface.cpp
-        )
+    )
 endif()
-
-set (sourceCPP ${sourceCPP} 
-    ../../../3LCache/TLCache.cpp
-    ../../../3LCache/TLCache_Interface.cpp
-    ../../../3LCache/TLCacheMAB.cpp
-    ../../../3LCache/TLCacheMAB_Interface.cpp
-)
 
 set (sourceCPP ${sourceCPP} 
     ../../../../3LCache+/TLCacheN.cpp
@@ -137,4 +135,3 @@ set_target_properties(evictionCPP
         
 # add_library(eviction INTERFACE)
 # target_link_libraries(eviction INTERFACE ${evictionLib})
-
