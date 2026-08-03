@@ -64,11 +64,6 @@ void TLCacheMABCache::init_with_params(const map<string, string> &params) {
         
         profiler.init(mode_str, policy_file_path, config_file_path, this->getSize());
 
-        // If running in TEST mode, prefer using MAB ranking (avoid baseline-only ties)
-        if (mode_str == "test") {
-            active_leader_is_mab = true;
-        }
-
         if (shadow_base == nullptr && shadow_victor == nullptr) {
             shadow_base = new TLCacheCache();
             shadow_base->setSize(this->getSize());

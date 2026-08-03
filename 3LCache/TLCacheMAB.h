@@ -3,6 +3,8 @@
 
 #include "TLCache.h"
 #include <algorithm>
+#include <string>
+#include "WorkloadProfiler.hpp"
 
 namespace TLCache {
 
@@ -14,8 +16,10 @@ enum class ArmStrategy : uint8_t {
 
 class TLCacheMABCache : public TLCacheCache {
 public:
-    // --- EXP3 configuration ---
     static const uint8_t MAX_ARMS = 16;
+    
+    WorkloadProfiler profiler;
+
     uint8_t  mab_k       = 4;
     ArmStrategy arm_strategy = ArmStrategy::POSITION;
     double   mab_gamma   = 0.1;
@@ -27,18 +31,24 @@ public:
     uint64_t mab_total_evictions = 0;
     uint64_t mab_arm_eviction_count[MAX_ARMS];
 
-    // דריסת פונקציות הליבה לניהול שלושת המטמונים במקביל
+    // משתני טורניר וקבצים ברמת המופע בלבד (מונע זליגת מידע ברקע)
+    uint64_t global_seq           = 0;
+    uint64_t base_window_misses   = 0;
+    uint64_t victor_window_misses = 0;
+    bool     active_leader_is_mab = false;
+
+    std::string policy_file_path  = "meta_policy.txt";
+    std::string config_file_path  = "profiler_config.txt";
+
     bool lookup(const SimpleRequest &req) override;
     uint32_t rank() override;
     void evict_with_candidate(pair<uint64_t, uint32_t> &epair) override;
     void init_with_params(const map<string, string> &params) override;
 
-    // משתני שליטה לבידוד הזיכרון של היקומים המקבילים
     TLCacheCache* shadow_base = nullptr;
     void*         shadow_victor = nullptr; 
     bool          is_shadow_instance = false;
 
-    // Destructor לניקוי זיכרון בטוח בסיום הריצה
     virtual ~TLCacheMABCache() {
         if (!is_shadow_instance) {
             delete shadow_base;

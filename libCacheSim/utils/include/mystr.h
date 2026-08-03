@@ -25,4 +25,7 @@ uint64_t str_to_u64(const char *start, size_t len);
 /* replace all matching char in a string */
 char *replace_char(char *str, char find, char replace);
 
+/* replace underscores with hyphens in key=value param keys only (not values) */
+char *replace_underscores_in_param_keys(char *str);
+
 const char *mybasename(const char *path);
