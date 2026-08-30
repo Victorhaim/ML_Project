@@ -283,7 +283,9 @@ file(GLOB cache_source
     ${PROJECT_SOURCE_DIR}/libCacheSim/cache/prefetch/*.c
 
     ${PROJECT_SOURCE_DIR}/libCacheSim/cache/eviction/LHD/*
-    ${PROJECT_SOURCE_DIR}/libCacheSim/cache/eviction/cpp/*
+    ${PROJECT_SOURCE_DIR}/libCacheSim/cache/eviction/cpp/LFU.cpp
+    ${PROJECT_SOURCE_DIR}/libCacheSim/cache/eviction/cpp/GDSF.cpp
+    ${PROJECT_SOURCE_DIR}/libCacheSim/cache/eviction/cpp/LRU_K.cpp
 )
 
 if(EXISTS ${PROJECT_SOURCE_DIR}/libCacheSim/cache/eviction/fifo)

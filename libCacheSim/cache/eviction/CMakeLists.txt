@@ -82,9 +82,6 @@ set(sourceCPP
         LHD/LHD_Interface.cpp
         ../../../3LCache/TLCache.cpp
         ../../../3LCache/TLCache_Interface.cpp
-        ../../../3LCache/TLCacheMAB.cpp
-        ../../../3LCache/TLCacheMAB_Interface.cpp
-        cpp/WorkloadProfiler.cpp
         )
 
 if (ENABLE_LRB)
@@ -117,6 +114,19 @@ endif()
 
 add_library (evictionC ${sourceC})
 target_link_libraries(evictionC cachelib dataStructure utils)
+
+list(APPEND sourceCPP
+    "${CMAKE_SOURCE_DIR}/3LCache/DiagLogger.cpp"
+    "${CMAKE_SOURCE_DIR}/3LCache/TLCache.cpp"
+    "${CMAKE_SOURCE_DIR}/3LCache/TLCacheMAB.cpp"
+    "${CMAKE_SOURCE_DIR}/3LCache/TLCacheMAB_Interface.cpp"
+    "${CMAKE_SOURCE_DIR}/3LCache/TLCache_Interface.cpp"
+    "${CMAKE_SOURCE_DIR}/3LCache/TrainLogger.cpp"
+    "${CMAKE_SOURCE_DIR}/3LCache/WinLedger.cpp"
+    "${CMAKE_SOURCE_DIR}/3LCache/WorkloadProfiler.cpp"
+    "${CMAKE_SOURCE_DIR}/3LCache/WorkloadProfiler_flush.cpp"
+)
+
 add_library (evictionCPP ${sourceCPP})
 target_link_libraries(evictionCPP cachelib utils)
 set_target_properties(evictionCPP

@@ -1,0 +1,17 @@
+feature,match,p5,p95,table_lo,table_hi,cover_pct,boxes,dead,verdict
+write_ratio,no,0,0,0,0,100,47,yes,ignore
+avg_request_size,yes,2445.28,33827.3,2187.25,43470.4,52.0802,45,no,weak
+size_variance,yes,6.56594e+07,1.42196e+10,941868,2.08811e+10,61.4283,36,no,weak
+singleton_ratio,yes,0.34729,0.999695,0.222839,1,74.8621,47,no,ok
+popularity_skewness,yes,0.0151016,5.00562,0,18.6653,94.5985,38,no,good
+avg_frequency,yes,1.00018,1.89893,1,2.16376,74.7627,46,no,ok
+object_diversity,yes,0.526611,0.999817,0.462158,1,79.6723,46,no,ok
+avg_reuse_distance,yes,3017.07,491025,3139.12,674866,90.2286,47,no,good
+sequentiality_ratio,no,0.0690308,0.849731,0,0.55127,34.673,22,no,soft
+out_cache_hit_rate,yes,0,0.16394,0,0.188721,100,46,no,good
+request_rate,no,0.703537,1.92614,0.219243,1024,4.66753,22,yes,soft
+burstiness_index,no,0,4.40809,0,3.4772,31.791,47,no,soft
+arrival_time_variance,no,0,34.62,0,321.71,40.9741,39,no,soft
+working_set_byte_delta,yes,3.84385e+07,2.82315e+08,3.29129e+07,3.90831e+08,86.4924,45,no,good
+scan_ratio,yes,0.491394,0.998962,0.456299,0.94104,72.054,47,no,ok
+ALL_STRUCTURAL,,,,,,78.6179,,dead=0/10,ok

@@ -1,0 +1,4 @@
+trace,cache_size,base_bmr,mab_bmr,diff_mab_minus_base,winner,base_omr,base_bmr,mab_omr,mab_bmr
+cluster12.csv,32MB,0.80434,0.80434,0.000000,tie,0.85081,0.80434,0.85081,0.80434
+cluster24.csv,32MB,0.133277,0.133277,0.000000,tie,0.126645,0.133277,0.126645,0.133277
+cluster30.csv,32MB,0.106857,0.106857,0.000000,tie,0.110105,0.106857,0.110105,0.106857
