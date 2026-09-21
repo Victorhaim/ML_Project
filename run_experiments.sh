@@ -1,6 +1,6 @@
 #!/bin/bash
 # Held-out TEST: one run contains both the MAB actor and an exactly aligned
-# ThreeLCache shadow. It replays the closest trained policy without learning.
+# ThreeLCache shadow. Select legacy policy replay or a frozen arm booster.
 set -euo pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -31,7 +31,8 @@ mkdir -p "$INTERMEDIATE_DIR" "$POLICY_DIR" "$LOG_OUTPUT_DIR" "$TEST_OUTPUT_DIR"
 # cumulative source used to rebuild the user-facing matrix after each trace.
 rm -f "$TEST_OUTPUT_DIR/match_events.csv" \
       "$TEST_OUTPUT_DIR/match_stats.csv" \
-      "$TEST_OUTPUT_DIR/type_stats.csv"
+      "$TEST_OUTPUT_DIR/type_stats.csv" \
+      "$TEST_OUTPUT_DIR/arm_model_events.csv"
 
 # CSV column mapping (ignored for oracleGeneral binary traces).
 TRACE_PARAMS_COMMON="time-col=1,obj-id-is-num=true,obj-id-col=2,obj-size-col=3"
@@ -48,6 +49,15 @@ MISS_METRIC="${MISS_METRIC:-bmr}"   # bmr | omr
 # TEST refuses a nearest policy beyond this normalized distance and keeps the
 # exact baseline path. Set <=0 to disable the ceiling for an ablation run.
 TEST_MATCH_MAX_DIST="${TEST_MATCH_MAX_DIST:-3.5}"
+# `model` uses a frozen first-stage LightGBM to choose one of the four queue
+# sampling arms. `legacy` preserves policy-box replay for direct A/B runs.
+ARM_SELECTOR="${ARM_SELECTOR:-model}" # model | legacy
+ARM_MODEL_DIR="${ARM_MODEL_DIR:-$POLICY_DIR/arm-selector}"
+ARM_RISK_LAMBDA="${ARM_RISK_LAMBDA:-0.5}"
+if [ "$ARM_SELECTOR" != "legacy" ] && [ "$ARM_SELECTOR" != "model" ]; then
+    echo "ERROR: ARM_SELECTOR must be legacy or model"
+    exit 1
+fi
 
 # Held-out split is by data folder (./data vs external_data), so TEST_SOURCES
 # is optional. Set it only to further narrow which ./data traces run.
@@ -225,6 +235,8 @@ TEST_SOURCES=${TEST_SOURCES:-<all>}
 MAB_PARAMS=$MAB_PARAMS
 TEST_MATCH_MAX_DIST=$TEST_MATCH_MAX_DIST
 TEST_MATCH_WARMUP=full_feature_window
+ARM_SELECTOR=$ARM_SELECTOR
+ARM_RISK_LAMBDA=$ARM_RISK_LAMBDA
 MISS_METRIC=$MISS_METRIC
 Test traces: ${#TEST_TRACES[@]}
 ==========================================================
@@ -236,10 +248,23 @@ LOGHEADER
     for CACHE_SIZE in $CACHE_SIZES; do
         PRIMARY_FILE="$POLICY_DIR/meta_policy_v3_${CACHE_SIZE}.txt"
         CONFIG_FILE="$POLICY_DIR/profiler_config_v3_${CACHE_SIZE}.txt"
-        if [ -s "$PRIMARY_FILE" ]; then
+        if [ "$ARM_SELECTOR" = "legacy" ] && [ -s "$PRIMARY_FILE" ]; then
             echo "policy[$CACHE_SIZE]=$PRIMARY_FILE sha256=$(sha256sum "$PRIMARY_FILE" | awk '{print $1}')"
-        else
+        elif [ "$ARM_SELECTOR" = "legacy" ]; then
             echo "policy[$CACHE_SIZE]=MISSING:$PRIMARY_FILE"
+        else
+            MODEL_SUBDIR="$ARM_MODEL_DIR/$CACHE_SIZE"
+            MEAN_MODEL="$MODEL_SUBDIR/mean_model.txt"
+            DOWNSIDE_MODEL="$MODEL_SUBDIR/downside_model.txt"
+            MODEL_META="$MODEL_SUBDIR/metadata.txt"
+            CONFIG_FILE="$MODEL_SUBDIR/profiler_config_v3_${CACHE_SIZE}.txt"
+            for MODEL_FILE in "$MEAN_MODEL" "$DOWNSIDE_MODEL" "$MODEL_META"; do
+                if [ -s "$MODEL_FILE" ]; then
+                    echo "arm_model[$CACHE_SIZE]=$MODEL_FILE sha256=$(sha256sum "$MODEL_FILE" | awk '{print $1}')"
+                else
+                    echo "arm_model[$CACHE_SIZE]=MISSING:$MODEL_FILE"
+                fi
+            done
         fi
         if [ -s "$CONFIG_FILE" ]; then
             echo "config[$CACHE_SIZE]=$CONFIG_FILE sha256=$(sha256sum "$CONFIG_FILE" | awk '{print $1}')"
@@ -254,8 +279,14 @@ echo "trace,cache_size,base_${MISS_METRIC},mab_${MISS_METRIC},diff_mab_minus_bas
 echo "Running TEST: in-process shadow vs MAB"
 echo "Data root: $DATA_DIR"
 echo "MAB config: $MAB_PARAMS"
-echo "TEST match ceiling: $TEST_MATCH_MAX_DIST (farther candidates use baseline)"
-echo "TEST match warm-up: one full profiler feature window"
+echo "Arm selector: $ARM_SELECTOR"
+if [ "$ARM_SELECTOR" = "legacy" ]; then
+    echo "TEST match ceiling: $TEST_MATCH_MAX_DIST (farther candidates use baseline)"
+    echo "TEST match warm-up: one full profiler feature window"
+else
+    echo "Arm model risk lambda: $ARM_RISK_LAMBDA"
+    echo "Arm model warm-up: arm 3 until one full profiler feature window"
+fi
 echo "Metric: $MISS_METRIC (lower is better; diff = MAB - Base)"
 echo "Test traces: ${#TEST_TRACES[@]}"
 echo ""
@@ -280,6 +311,8 @@ fi
 
 for TRACE in "${TEST_TRACES[@]}"; do
     TRACE_NAME="$(basename "$TRACE")"
+    TRACE_REL="${TRACE#"$DATA_DIR"/}"
+    TRACE_ID="$(printf '%s' "$TRACE_REL" | tr ', ' '__')"
     if [ ! -f "$TRACE" ]; then
         echo "Skipping $TRACE_NAME (not found)"
         continue
@@ -297,8 +330,15 @@ for TRACE in "${TEST_TRACES[@]}"; do
         SIZE_TOKEN="${CACHE_SIZE%MB}"
         PRIMARY_FILE="$POLICY_DIR/meta_policy_v3_${CACHE_SIZE}.txt"
         CONFIG_FILE="$POLICY_DIR/profiler_config_v3_${CACHE_SIZE}.txt"
+        MODEL_SUBDIR="$ARM_MODEL_DIR/$CACHE_SIZE"
+        MEAN_MODEL="$MODEL_SUBDIR/mean_model.txt"
+        DOWNSIDE_MODEL="$MODEL_SUBDIR/downside_model.txt"
+        MODEL_META="$MODEL_SUBDIR/metadata.txt"
+        if [ "$ARM_SELECTOR" = "model" ]; then
+            CONFIG_FILE="$MODEL_SUBDIR/profiler_config_v3_${CACHE_SIZE}.txt"
+        fi
 
-        if [ ! -s "$PRIMARY_FILE" ]; then
+        if [ "$ARM_SELECTOR" = "legacy" ] && [ ! -s "$PRIMARY_FILE" ]; then
             echo "| $CACHE_SIZE | ERROR | ERROR | - | missing trained policy |"
             echo "ERROR: trained policy missing or empty: $PRIMARY_FILE" >> "$CENTRAL_LOG"
             TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
@@ -312,14 +352,44 @@ for TRACE in "${TEST_TRACES[@]}"; do
             TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
             continue
         fi
+        if [ "$ARM_SELECTOR" = "model" ]; then
+            if [ ! -s "$MEAN_MODEL" ] || [ ! -s "$DOWNSIDE_MODEL" ]; then
+                echo "| $CACHE_SIZE | ERROR | ERROR | - | missing arm model |"
+                echo "ERROR: arm selector models missing under $MODEL_SUBDIR" >> "$CENTRAL_LOG"
+                TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+                continue
+            fi
+            if [ -s "$MODEL_META" ]; then
+                META_SIZE="$(awk -F= '/^cache_size=/{print $2}' "$MODEL_META")"
+                META_FEATS="$(awk -F= '/^feature_count=/{print $2}' "$MODEL_META")"
+                if [ -n "$META_SIZE" ] && [ "$META_SIZE" != "$CACHE_SIZE" ]; then
+                    echo "| $CACHE_SIZE | ERROR | ERROR | - | arm model cache_size mismatch |"
+                    echo "ERROR: $MODEL_META cache_size=$META_SIZE" >> "$CENTRAL_LOG"
+                    TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+                    continue
+                fi
+                if [ -n "$META_FEATS" ] && [ "$META_FEATS" != "25" ]; then
+                    echo "| $CACHE_SIZE | ERROR | ERROR | - | arm model feature_count |"
+                    echo "ERROR: $MODEL_META feature_count=$META_FEATS" >> "$CENTRAL_LOG"
+                    TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+                    continue
+                fi
+            fi
+        fi
 
         TMP_MAB="$(mktemp)"
 
         # One run: MAB actor + exact in-process ThreeLCache shadow.
         # oracleGeneral.zst is streamed by cachesim; no unpack.
-        run_cachesim "$TRACE" 3lcache-mab "$CACHE_SIZE" \
-            "${MAB_PARAMS},profiler-mode=test,test-match-max-dist=${TEST_MATCH_MAX_DIST},policy-file=${PRIMARY_FILE},config-file=${CONFIG_FILE},diag-enable=0,train-log-enable=0,train-log-prefix=${LOG_OUTPUT_DIR}/mab_test_${CACHE_SIZE}" \
-            "$TMP_MAB"
+        if [ "$ARM_SELECTOR" = "model" ]; then
+            run_cachesim "$TRACE" 3lcache-mab "$CACHE_SIZE" \
+                "${MAB_PARAMS},profiler-mode=test,arm-selector=model,arm-mean-model=${MEAN_MODEL},arm-downside-model=${DOWNSIDE_MODEL},arm-risk-lambda=${ARM_RISK_LAMBDA},arm-model-events-file=${TEST_OUTPUT_DIR}/arm_model_events.csv,arm-trace-id=${TRACE_ID},arm-cache-size-label=${CACHE_SIZE},policy-file=${PRIMARY_FILE},config-file=${CONFIG_FILE},diag-enable=0,train-log-enable=0,train-log-prefix=${LOG_OUTPUT_DIR}/mab_test_${CACHE_SIZE}" \
+                "$TMP_MAB"
+        else
+            run_cachesim "$TRACE" 3lcache-mab "$CACHE_SIZE" \
+                "${MAB_PARAMS},profiler-mode=test,arm-selector=legacy,test-match-max-dist=${TEST_MATCH_MAX_DIST},policy-file=${PRIMARY_FILE},config-file=${CONFIG_FILE},diag-enable=0,train-log-enable=0,train-log-prefix=${LOG_OUTPUT_DIR}/mab_test_${CACHE_SIZE}" \
+                "$TMP_MAB"
+        fi
 
         BASE_PAIR=$(extract_shadow_pair "$TMP_MAB")
         MAB_PAIR=$(extract_mab_pair "$TMP_MAB")
@@ -392,6 +462,7 @@ echo "============================================"
 echo "Central log: $CENTRAL_LOG"
 echo "Compare CSV: $TEST_CSV"
 echo "TEST paste logs:"
-echo "  $TEST_OUTPUT_DIR/match_events.csv  # detailed audit: candidate/arm/features"
-echo "  $TEST_OUTPUT_DIR/match_stats.csv"
-echo "  $TEST_OUTPUT_DIR/type_stats.csv"
+echo "  $TEST_OUTPUT_DIR/match_events.csv  # per-window: type, size, delta, start arm"
+echo "  $TEST_OUTPUT_DIR/match_stats.csv   # KNN distance bands (legacy); model=unmatched"
+echo "  $TEST_OUTPUT_DIR/type_stats.csv    # type × size win/loss matrix"
+echo "  $TEST_OUTPUT_DIR/arm_model_events.csv"
