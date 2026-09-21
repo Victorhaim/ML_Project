@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <deque>
+#include <array>
 #include <unordered_map>
 #include <cstdint>
 #include <string>
@@ -46,17 +47,21 @@ struct RequestLog {
     bool first_time;
 };
 
-// Stored regime: min-max feature box + committed arm weights + measured
-// in-process delta against the exactly aligned ThreeLCache shadow.
+// KNN v5 row: one feature region, one persistent MODE-arm queue, and the
+// single best whole-regime run observed for that region.
 struct PolicyRecord {
     WorkloadFeatures features;
     WorkloadFeatures feat_min;
     WorkloadFeatures feat_max;
     bool has_box = false;
-    std::vector<double> weights;
+    int winner_arm = -1;
     double best_miss_rate = 1.0;
-    // Positive means MAB beat the in-process ThreeLCache shadow.
-    double best_delta = 0.0;
+    double best_delta = -1e300;
+    std::vector<uint8_t> arm_queue;
+    uint8_t queue_next = 0;
+    // Bit i is set only after arm i completed a TRAIN regime. Queue position
+    // alone cannot express coverage after the queue wraps.
+    uint16_t tried_arms_mask = 0;
 };
 
 class WorkloadProfiler {
@@ -65,13 +70,12 @@ private:
     static constexpr double MAX_WEIGHT_RATIO = 100.0;
     // Storage may keep strongly-locked winning arms; injection stays stricter.
     static constexpr double MAX_STORABLE_WEIGHT_RATIO = 1000.0;
-    // Dynamic-regime boundaries: feature ε from anchor, byte shock, or max len.
-    // Arm thrash must NOT close a regime (arm clock is separate).
-    static constexpr size_t   MAX_PHASE_LEN = 50000;
+    // Dynamic-regime boundaries: feature ε from the anchor, or a byte shock.
+    // A regime lasts exactly as long as the behaviour that defines it: there
+    // is deliberately no length cap and no minimum length. Arm thrash must NOT
+    // close a regime (the arm clock is separate), and an underperforming arm
+    // is re-decided on the arm clock rather than by cutting the regime.
     static constexpr double   SHOCK_SIZE_MULT = 8.0;   // req size vs window avg
-    static constexpr size_t   SHOCK_MIN_PHASE = 1000;  // min phase len after a shock
-    // Debounce for event-driven closes only; storing a policy has no min length.
-    static constexpr size_t   MIN_STORE_LEN = 2000;
     // The EWMA variance of a stable feature decays toward zero, which blows up
     // every normalized distance and drags the regime threshold with it. Floor
     // the per-feature sigma both absolutely and relative to the feature scale.
@@ -85,20 +89,39 @@ private:
     static constexpr double   MAX_MATRIX_EPSILON = 1.0;
     static constexpr uint64_t TEST_MATCH_RETRY = 1000;
     // A regime closes on feature stability, so its stored min/max box only
-    // spans the noise of a deliberately steady window: 2-6% wide on average
-    // and exactly zero on a third of the rows. Demanding all ten structural
-    // features inside one such box is unreachable - measured 0 of 1629
-    // held-out regimes, and 42% of training rows fail it against each other.
-    // Pad by sigma and accept a majority instead of the full conjunction;
-    // the TEST distance ceiling is what keeps replay from drifting.
+    // spans the noise of a deliberately steady window. Pad by sigma and
+    // accept 80% of whichever features the experiment mask enables.
+    // TEST uses a soft distance vote, so distant rows fade rather than being
+    // accepted/rejected at a hard threshold.
     static constexpr double   POINT_BOX_PAD = 2.0;
-    static constexpr int      MATCH_MIN_STRUCTURAL = 8; // of 10 structural
+    // Hard containment (open-match and skip_covered) uses only features whose
+    // scale is set by the access pattern. Time/op/sequence coordinates may
+    // still enter KNN distance when the screen mask enables them, but they
+    // must not veto "we have seen this regime."
+    static constexpr bool MATCH_STRUCTURAL[15] = {
+        false, // write_ratio
+        true,  // avg_request_size
+        true,  // size_variance
+        true,  // singleton_ratio
+        true,  // popularity_skewness
+        true,  // avg_frequency
+        true,  // object_diversity
+        true,  // avg_reuse_distance
+        false, // sequentiality_ratio
+        true,  // out_cache_hit_rate
+        false, // request_rate
+        false, // burstiness_index
+        false, // arrival_time_variance
+        true,  // working_set_byte_delta
+        true   // scan_ratio
+    };
     // Slow EMA: the gap scale should follow the trace, not a single burst.
     static constexpr double   DT_SCALE_ALPHA = 1e-4;
 
     ProfilerMode current_mode;
     size_t window_size;
     std::deque<RequestLog> window;
+    bool profile_ready_seen = false;
 
     std::unordered_map<uint64_t, size_t> id_counts;
     std::unordered_map<uint64_t, uint32_t> unique_id_sizes;
@@ -109,6 +132,7 @@ private:
     WorkloadFeatures phase_box_min;
     WorkloadFeatures phase_box_max;
     bool phase_box_init = false;
+    bool phase_profile_ready = false;
     WorkloadFeatures prev_window_features;
 
     std::string policy_filename;
@@ -116,7 +140,7 @@ private:
 
     size_t flush_interval;
     uint64_t request_counter;
-    uint8_t current_mab_k = 4;
+    uint8_t current_mab_k = 6;
 
     double shift_threshold = 0.05;
     double matrix_epsilon  = 0.02;
@@ -124,29 +148,15 @@ private:
     double ema_delta_var;
     const double alpha = 0.05;
 
-    // Hard containment is required only on features whose scale is set by the
-    // access pattern itself. Op/time/sequence features depend on the trace
-    // file format, so they contribute to distance but must not veto a match.
-    static constexpr bool MATCH_STRUCTURAL[15] = {
-        false, // write_ratio: no op column is mapped, so it is constant
-        true,  // avg_request_size
-        true,  // size_variance
-        true,  // singleton_ratio
-        true,  // popularity_skewness
-        true,  // avg_frequency
-        true,  // object_diversity
-        true,  // avg_reuse_distance
-        false, // sequentiality_ratio: needs offset-style ids to be meaningful
-        true,  // out_cache_hit_rate
-        false, // request_rate
-        false, // burstiness_index
-        false, // arrival_time_variance
-        true,  // working_set_byte_delta
-        true   // scan_ratio
-    };
+    // Default keeps historical behavior: all 15 coordinates participate.
+    // The feature-screen shell passes a 15-bit mask to override this per run.
+    std::array<bool, 15> feature_active{{
+        true, true, true, true, true, true, true, true,
+        true, true, true, true, true, true, true
+    }};
 
     const double feature_importance_weights[15] = {
-        0.0, // write_ratio: constant until an op column is mapped
+        1.0, // write_ratio
         1.5, // avg_request_size
         1.0, // size_variance
         1.5, // singleton_ratio
@@ -195,6 +205,7 @@ private:
     // seconds-based and tick-based traces produce comparable values.
     double dt_scale;
     uint64_t last_match_attempt_seq = 0;
+    std::string last_regime_close_reason;
     bool active_policy_match = false;
     bool active_match_refused = false;
     int active_match_band = 6; // unmatched
@@ -204,7 +215,6 @@ private:
     int active_policy_type = 10;
     WorkloadFeatures active_inject_features;
     std::vector<double> active_policy_weights;
-    double test_match_max_dist = 3.5;
 
     size_t write_count;
     double size_sum;
@@ -222,7 +232,27 @@ private:
     size_t first_time_seen_count;
 
     std::vector<PolicyRecord> policy_matrix;
+    // Street map: bins on size / reuse / skew. Memory is the DB; the policy
+    // file is only a per-trace checkpoint.
+    std::unordered_map<uint64_t, std::vector<int>> policy_grid;
+    std::vector<int> policy_wide;
+    uint64_t policy_tombstones = 0;
+    void rebuild_policy_index();
+    void index_insert_row(int row);
+    int index_bin(size_t feat, double x) const;
+    static uint64_t index_pack(int a, int b, int c);
+    bool index_linear_faster() const;
+    bool index_box_too_wide(const WorkloadFeatures& mn,
+                            const WorkloadFeatures& mx) const;
+    std::vector<int> index_candidates_point(const WorkloadFeatures& p) const;
+    std::vector<int> index_candidates_box(const WorkloadFeatures& mn,
+                                          const WorkloadFeatures& mx) const;
     TrainLogger train_log;
+    int active_train_policy_row = -1;
+    int active_train_arm = 3;
+    // Rotation used when no stored row covers a regime. Rows are created only
+    // by a scored close, so an unmatched open must still spread arms evenly.
+    uint8_t train_arm_rotation = 0;
 
     // Compact regime statistics by request-size area. Events are appended and
     // later aggregated into regime_stats.csv (not a per-regime report).
@@ -250,7 +280,41 @@ private:
     static int size_area_index(double avg_size);
     static const char* size_area_name(int idx);
     void note_regime_close(const char* action, double delta_bmr);
-    void flush_regime_events();
+    // The small *_stats.csv are formatted from live counters, never by
+    // re-reading event dumps, so they exist even with the dumps disabled.
+    static constexpr uint64_t STATS_REWRITE_EVERY = 32; // closed regimes
+    static constexpr uint64_t FEATURE_STATS_EVERY = 256;
+    static constexpr size_t   STATS_SAMPLE_CAP = 8192;    // per reservoir
+    uint64_t stat_closes = 0;
+    uint64_t stat_last_rewrite = 0;
+    uint64_t feature_stat_last_rewrite = 0;
+    uint64_t test_stat_closes = 0;
+    uint64_t test_stat_last_rewrite = 0;
+    uint64_t stats_rng = 0x9E3779B97F4A7C15ULL;
+
+    // Exact until the cap, uniformly sampled after it, so medians and p5/p95
+    // stay representative without retaining every regime.
+    struct SampleSet {
+        std::vector<double> v;
+        uint64_t seen = 0;
+    };
+    void sample_add(SampleSet& s, double x);
+
+    struct TrainAgg {
+        uint64_t regimes = 0, bytes = 0, long_enough = 0, arm_chosen = 0;
+        uint64_t beat = 0, lost = 0, stored = 0, delta_n = 0;
+        double   delta_sum = 0.0;
+        SampleSet deltas;
+        SampleSet lens;
+    };
+    TrainAgg train_band[N_SIZE_AREAS];
+    TrainAgg train_all;
+    TrainAgg train_type[N_REGIME_TYPES + 1][N_SIZE_AREAS + 1];
+
+    std::vector<std::vector<double>> feature_reservoir;
+    uint64_t feature_reservoir_seen = 0;
+
+    void flush_regime_events(bool rebuild_stats = false);
     void rewrite_regime_stats() const;
     void rewrite_type_stats() const;
     void flush_feature_samples();
@@ -260,6 +324,15 @@ private:
     // Bands: in_box, <=0.02, 0.02-0.05, 0.05-0.15, 0.15-0.50,
     // >0.50, unmatched.
     static constexpr int N_MATCH_BANDS = 7;
+    struct TestAgg {
+        uint64_t regimes = 0, bytes = 0, applied = 0, applied_bytes = 0;
+        uint64_t refused = 0, refused_bytes = 0, won = 0, lost = 0, arm_chosen = 0;
+        double delta_sum = 0.0, byte_delta_sum = 0.0;
+        SampleSet deltas;
+    };
+    TestAgg test_band[N_MATCH_BANDS][N_SIZE_AREAS + 1];
+    TestAgg test_grand;
+    TestAgg test_type[N_REGIME_TYPES + 1][N_SIZE_AREAS + 1];
     struct TestMatchEvent {
         double avg_size = 0.0;
         uint64_t len = 0;
@@ -288,7 +361,7 @@ private:
     static const char* match_band_name(int idx);
     void note_test_match_close(double delta_bmr, uint64_t win_requests,
                                uint64_t win_bytes, const char* close_reason);
-    void flush_test_match_events();
+    void flush_test_match_events(bool rebuild_stats = false);
     void rewrite_test_match_stats() const;
     void rewrite_test_type_stats() const;
     void set_test_match_stats_paths(const std::string& events_path,
@@ -305,6 +378,14 @@ private:
     void recalculate_features();
     void update_feature_statistics(const WorkloadFeatures& f);
     double feature_std(size_t i) const;
+    // A masked-off feature, or one whose observed spread never rose above the
+    // variance floor. A constant coordinate is inside every box and adds zero
+    // to the distance numerator, so letting it participate manufactures
+    // agreement that the workload never showed.
+    bool feature_usable(size_t i) const;
+    // Usable AND structural: the backup's match/merge axes, intersected with
+    // the experiment mask.
+    bool feature_matchable(size_t i) const;
     void clamp_thresholds();
     std::vector<double> to_vector(const WorkloadFeatures& f) const;
     void from_vector(const std::vector<double>& v, WorkloadFeatures& f) const;
@@ -340,12 +421,14 @@ private:
                               const WorkloadFeatures& box_min,
                               const WorkloadFeatures& box_max,
                               bool has_box,
-                              const std::vector<double>& weights,
+                              int arm,
                               double miss_rate,
                               double delta,
                               double* out_dist = nullptr);
-    // Prefer the closest containing box; if none contains the point, replay
-    // the closest valid row and classify it by normalized feature distance.
+    void initialize_arm_queue(PolicyRecord& record);
+    // Five-neighbour soft-distance vote over each row's saved winner.
+    // Positive-delta rows receive full priority even with partial arm
+    // coverage. Losing rows are discounted by tried-arm coverage.
     std::vector<double> find_closest_policy(const WorkloadFeatures& current,
                                             bool* out_in_box = nullptr,
                                             int* out_policy_row = nullptr);
@@ -358,10 +441,12 @@ public:
               const std::string& policy_file = "meta_policy_v3.txt",
               const std::string& config_file = "profiler_config_v3.txt",
               size_t cache_size = 10000,
-              uint8_t mab_k = 4,
+              uint8_t mab_k = 6,
               bool train_log_enable = true,
               const std::string& train_log_prefix = "mab_train",
-              uint64_t train_log_interval = 10000);
+              uint64_t train_log_interval = 10000,
+              const std::string& feature_mask = "111111111111111",
+              bool persist_event_logs = true);
 
     // arm_committed: MAB has finished investigate and locked a policy for this
     // feature regime. Only committed regimes are stored.
@@ -383,10 +468,24 @@ public:
     void set_type_stats_path(const std::string& stats_path);
 
     WorkloadFeatures get_features() const { return current_features; }
+    int current_regime_type_idx() const {
+        return classify_regime_type(current_features);
+    }
+    std::vector<double> get_feature_vector() const {
+        return to_vector(current_features);
+    }
+    bool is_profile_ready() const { return window.size() >= window_size; }
+    const std::string& get_last_regime_close_reason() const {
+        return last_regime_close_reason;
+    }
     ProfilerMode get_mode() const { return current_mode; }
     size_t matrix_size() const { return policy_matrix.size(); }
     double get_shift_threshold() const { return shift_threshold; }
-    void set_test_match_max_dist(double distance);
+    uint8_t select_regime_arm(bool* out_matched = nullptr);
+    // MODEL TEST: record the first-tree start so match/type stats still
+    // have an arm and mix without KNN inject.
+    void set_window_start_audit(int start_arm,
+                                const std::vector<double>& start_arc);
 };
 
 #endif // WORKLOAD_PROFILER_HPP

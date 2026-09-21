@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <string>
 
@@ -21,6 +22,7 @@ typedef struct {
     SimpleRequest    shadow_req;
     char            *objective;
     int              arm_count;
+    char            *arm_selector;
     char            *arm_strategy;
     double           mab_gamma;
     char            *profiler_mode;
@@ -39,7 +41,8 @@ typedef struct {
 } TLCacheMAB_params_t;
 
 static const char *DEFAULT_PARAMS =
-    "objective=byte-miss-ratio,arm_count=4,arm_strategy=mode,mab_gamma=0.05,"
+    "objective=byte-miss-ratio,arm_count=6,arm_selector=knn,"
+    "arm_strategy=mode,mab_gamma=0.05,"
     "profiler_mode=train,policy_file=meta_policy_v3.txt,"
     "config_file=profiler_config_v3.txt,"
     "diag_interval=10000,diag_prefix=mab_diag";
@@ -54,6 +57,8 @@ static bool    TLCacheMAB_remove(cache_t *cache, const obj_id_t obj_id);
 static int64_t TLCacheMAB_get_occupied_byte(const cache_t *cache);
 static int64_t TLCacheMAB_get_n_obj(const cache_t *cache);
 static void    TLCacheMAB_parse_params(cache_t *cache, const char *cache_specific_params);
+static void    TLCacheMAB_merge_params(std::map<std::string, std::string> &out,
+                                       const char *cache_specific_params);
 
 cache_t *TLCacheMAB_init(const common_cache_params_t ccache_params,
                           const char *cache_specific_params) {
@@ -82,7 +87,8 @@ cache_t *TLCacheMAB_init(const common_cache_params_t ccache_params,
     cache->eviction_params = params;
 
     params->objective     = strdup("byte-miss-ratio");
-    params->arm_count     = 4;
+    params->arm_count     = 6;
+    params->arm_selector  = strdup("knn");
     params->arm_strategy  = strdup("mode");
     params->mab_gamma     = 0.05;
     params->profiler_mode = strdup("train");
@@ -133,6 +139,12 @@ cache_t *TLCacheMAB_init(const common_cache_params_t ccache_params,
     else if (params->train_log_enable == 1) params_map["train_log_enable"] = "1";
     params_map["mab_off"]    = params->mab_off ? "1" : "0";
     // diag/train_log enable == -1 => leave unset for C++ auto mode
+    // Every -e key (including KNN policy/config paths) must reach C++.
+    if (cache_specific_params != NULL) {
+        TLCacheMAB_merge_params(params_map, cache_specific_params);
+    } else {
+        TLCacheMAB_merge_params(params_map, DEFAULT_PARAMS);
+    }
 
     mab->init_with_params(params_map);
 
@@ -158,6 +170,7 @@ static void TLCacheMAB_free(cache_t *cache) {
     }
     delete mab;
     free(params->objective);
+    free(params->arm_selector);
     free(params->arm_strategy);
     free(params->profiler_mode);
     free(params->policy_file);
@@ -271,6 +284,22 @@ static int64_t TLCacheMAB_get_occupied_byte(const cache_t *cache) {
     return (int64_t)mab->_currentSize;
 }
 
+static void TLCacheMAB_merge_params(std::map<std::string, std::string> &out,
+                                    const char *cache_specific_params) {
+    if (cache_specific_params == NULL) return;
+    char *params_str = strdup(cache_specific_params);
+    char *rest = params_str;
+    while (rest != NULL && rest[0] != '\0') {
+        char *key = strsep(&rest, "=");
+        char *value = strsep(&rest, ",");
+        while (rest != NULL && *rest == ' ') rest++;
+        if (key != NULL && value != NULL && key[0] != '\0') {
+            out[key] = value;
+        }
+    }
+    free(params_str);
+}
+
 static void TLCacheMAB_parse_params(cache_t *cache, const char *cache_specific_params) {
     auto *params = static_cast<TLCacheMAB_params_t *>(cache->eviction_params);
     char *params_str = strdup(cache_specific_params);
@@ -284,6 +313,10 @@ static void TLCacheMAB_parse_params(cache_t *cache, const char *cache_specific_p
         if (strcasecmp(key, "objective") == 0) {
             free(params->objective);
             params->objective = strdup(value);
+        } else if (strcasecmp(key, "arm_selector") == 0 ||
+                   strcasecmp(key, "arm-selector") == 0) {
+            free(params->arm_selector);
+            params->arm_selector = strdup(value);
         } else if (strcasecmp(key, "arm_count") == 0 || strcasecmp(key, "arm-count") == 0) {
             params->arm_count = atoi(value);
         } else if (strcasecmp(key, "arm_strategy") == 0 || strcasecmp(key, "arm-strategy") == 0) {
