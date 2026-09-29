@@ -147,7 +147,6 @@ public:
     double start_arc_width = 1.0;
     std::array<uint64_t, N_ZONES> zone_samples{{0, 0, 0}};
     std::array<uint64_t, N_ZONES> zone_evictions{{0, 0, 0}};
-
     // Persistent scan cursor, the same idea as TLCacheCache::samplepointer: a
     // call resumes where the last one stopped rather than restarting at
     // q.head, so one call costs a batch of steps instead of a whole lap.
@@ -247,6 +246,10 @@ public:
     int arm_stream_cell_id() const;
     uint8_t arm_rotate_start();
     void arm_set_arc_from_arm(uint8_t arm);
+    // TEST only: interpolate the matched neighbours' arcs into one arc, then
+    // sample it with the same arc sampler TRAIN uses.
+    void arm_set_arc_from_weights(const std::vector<double>& arm_weights,
+                                  uint8_t fallback_arm);
     // -1 when this slot was not sampled in the current lap.
     int arm_zone_of_pos(uint32_t pos) const;
     void arm_zone_begin_lap(uint32_t queue_len);

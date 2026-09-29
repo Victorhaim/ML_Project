@@ -22,13 +22,19 @@ MSR_SOURCE="${MSR_SOURCE:-msr_full}"
 SCREEN_ROOT="${SCREEN_ROOT:-$SCRIPT_DIR/feature-screen/msr}"
 CACHESIM="${CACHESIM:-$SCRIPT_DIR/_build/bin/cachesim}"
 CACHE_SIZE="${CACHE_SIZE:-32MB}"
+# store-min-delta is the shadow-beating margin a regime needs to earn a policy
+# row. 0 stores any regime that did not lose; 0.005 restores the old
+# wins-only table. store-seed-uncovered additionally stores regions no row
+# reaches yet, so the table gains coverage and not only winners.
+STORE_MIN_DELTA="${STORE_MIN_DELTA:-0}"
+STORE_SEED_UNCOVERED="${STORE_SEED_UNCOVERED:-1}"
 # Mean + SHIFT_SIGMA * std of tick-to-tick feature distance closes a regime.
 # 2 splits slow drift into more table boxes; 3 restores the old rare-jump clock.
 SHIFT_SIGMA="${SHIFT_SIGMA:-2}"
 # Containment pad in units of the feature's robust sigma. Raising it merges
 # neighbouring regimes into one row; 2 makes every regime land in every box.
 BOX_PAD="${BOX_PAD:-0.1}"
-BASE_MAB_PARAMS="${BASE_MAB_PARAMS:-arm-count=6,arm-strategy=mode,mab-gamma=0.05,objective=byte-miss-ratio,arm-selector=knn,shift-sigma=${SHIFT_SIGMA},box-pad=${BOX_PAD}}"
+BASE_MAB_PARAMS="${BASE_MAB_PARAMS:-arm-count=6,arm-strategy=mode,mab-gamma=0.05,objective=byte-miss-ratio,arm-selector=knn,store-min-delta=${STORE_MIN_DELTA},store-seed-uncovered=${STORE_SEED_UNCOVERED},shift-sigma=${SHIFT_SIGMA},box-pad=${BOX_PAD}}"
 FEATURE_SETS="${FEATURE_SETS:-}"
 RESET_SPLIT="${RESET_SPLIT:-0}"
 RESET_SETS="${RESET_SETS:-0}"
@@ -370,25 +376,6 @@ while IFS='|' read -r SET_ID SET_KIND MASK ACTIVE_COUNT DESCRIPTION; do
     TRAIN_LOG_DIR="$SET_DIR/logs/train"
     TEST_LOG_DIR="$SET_DIR/logs/test"
     mkdir -p "$SET_DIR" "$TRAIN_LOG_DIR" "$TEST_LOG_DIR"
-
-    # v8 changed row semantics: geography creates rows and every revisit
-    # records its arm outcome. Resuming a v7 progress log with a rejected
-    # table would skip all TRAIN traces and then TEST an empty policy.
-    if [ -s "$POLICY" ]; then
-        IFS= read -r POLICY_HEADER < "$POLICY" || POLICY_HEADER=""
-        case "$POLICY_HEADER" in
-            "knn_v8,mask=${MASK},"*) ;;
-            *)
-                echo "  [schema reset] old/incompatible policy; restarting set $SET_ID"
-                rm -f "$POLICY" "$CONFIG" "$PROGRESS"
-                rm -rf "$TRAIN_LOG_DIR" "$TEST_LOG_DIR"
-                mkdir -p "$TRAIN_LOG_DIR" "$TEST_LOG_DIR"
-                ;;
-        esac
-    elif [ -s "$PROGRESS" ]; then
-        echo "  [resume reset] progress exists without policy; restarting set $SET_ID"
-        rm -f "$CONFIG" "$PROGRESS"
-    fi
     touch "$PROGRESS"
 
     ACTIVE_NAMES="$(active_feature_names "$MASK")"
@@ -434,7 +421,7 @@ while IFS='|' read -r SET_ID SET_KIND MASK ACTIVE_COUNT DESCRIPTION; do
         exit 1
     fi
 
-    # ---- TEST: frozen policy; feature-only regime clock remains adaptive --
+    # ---- TEST: frozen table on the held-out traces -----------------------
     SET_TEST_CSV="$SET_DIR/test_per_trace.csv"
     echo "trace,bytes,mab_bmr,shadow_bmr,diff" > "$SET_TEST_CSV"
     while IFS= read -r TRACE; do

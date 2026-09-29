@@ -29,6 +29,7 @@ WorkloadProfiler::WorkloadProfiler() :
     current_mode(ProfilerMode::TRAIN), window_size(20000),
     flush_interval(0), request_counter(0), current_mab_k(6),
     shift_threshold(0.05), matrix_epsilon(0.02),
+    shift_sigma(DEFAULT_SHIFT_SIGMA),
     ema_delta_mean(0.02), ema_delta_var(0.0004),
     phase_requests(0), phase_misses(0), local_seq(0), last_id(0), last_size(0),
     last_timestamp(0.0), dt_scale(0.0),
@@ -40,7 +41,10 @@ WorkloadProfiler::WorkloadProfiler() :
     for (int i = 0; i < 15; ++i) {
         feature_means[i] = 0.0;
         feature_vars[i]  = 1.0;
+        feature_scale[i] = 0.0;
+        loaded_scale[i]  = 0.0;
     }
+    rebuild_active_index();
     current_features = WorkloadFeatures();
     phase_start_features = WorkloadFeatures();
     phase_box_min = WorkloadFeatures();
@@ -202,10 +206,9 @@ bool WorkloadProfiler::box_inside_box(const WorkloadFeatures& inner_min,
     auto imx = to_vector(inner_max);
     auto omn = to_vector(outer_min);
     auto omx = to_vector(outer_max);
-    for (size_t i = 0; i < 15; ++i) {
+    for (size_t i : active_idx) {
         if (!feature_matchable(i)) continue;
-        const double pad = POINT_BOX_PAD * feature_std(i);
-        if (imn[i] < omn[i] - pad || imx[i] > omx[i] + pad) return false;
+        if (imn[i] < omn[i] || imx[i] > omx[i]) return false;
     }
     return true;
 }
@@ -216,18 +219,13 @@ bool WorkloadProfiler::point_in_box(const WorkloadFeatures& p,
     auto pv = to_vector(p);
     auto lo = to_vector(mn);
     auto hi = to_vector(mx);
-    int inside = 0;
     int match_count = 0;
-    for (size_t i = 0; i < 15; ++i) {
+    for (size_t i : active_idx) {
         if (!feature_matchable(i)) continue;
         match_count++;
-        double pad = POINT_BOX_PAD * feature_std(i);
-        if (pv[i] >= lo[i] - pad && pv[i] <= hi[i] + pad) inside++;
+        if (pv[i] < lo[i] || pv[i] > hi[i]) return false;
     }
-    // Backup: 8 of 10 structural. Same 80% rule on whichever structural
-    // features the mask still enables.
-    const int required = (4 * match_count + 4) / 5; // ceil(80%)
-    return match_count > 0 && inside >= required;
+    return match_count > 0;
 }
 
 bool WorkloadProfiler::record_contains(const WorkloadFeatures& p,
@@ -243,7 +241,7 @@ bool WorkloadProfiler::record_contains(const WorkloadFeatures& p,
         auto v2 = to_vector(rec.features);
         double weighted_sum = 0.0;
         double total_weight = 0.0;
-        for (size_t i = 0; i < 15; ++i) {
+        for (size_t i : active_idx) {
             if (!feature_usable(i)) continue;
             double norm_diff = std::min(MAX_NORM_DIFF,
                                         std::abs(v1[i] - v2[i]) / feature_std(i));
@@ -260,7 +258,11 @@ void WorkloadProfiler::open_new_regime() {
     phase_box_min = current_features;
     phase_box_max = current_features;
     phase_box_init = true;
+    phase_box_frozen = false;
     phase_profile_ready = profile_ready_seen;
+    drift_ticks = 0;
+    phase_ticks = 0;
+    phase_shock_count = 0;
     phase_requests = 0;
     phase_misses = 0;
     phase_bytes = 0;
@@ -277,6 +279,7 @@ void WorkloadProfiler::open_new_regime() {
     active_match_refused = false;
     active_match_band = N_MATCH_BANDS - 1;
     active_match_dist = 1e300;
+    active_nn_dist.fill(-1.0);
     active_policy_row = -1;
     active_policy_arm = -1;
     active_policy_type = N_REGIME_TYPES - 1;
@@ -334,13 +337,17 @@ const char* WorkloadProfiler::upsert_policy(const WorkloadFeatures& center,
             center, policy_matrix[static_cast<size_t>(i)].features);
         if (dist < min_dist) min_dist = dist;
     };
-    if (index_linear_faster()) {
+    if (index_linear_faster(IndexUse::Lookup)) {
         for (size_t i = 0; i < policy_matrix.size(); ++i) consider_near(static_cast<int>(i));
     } else {
         for (int i : index_candidates_point(center)) consider_near(i);
     }
     if (out_dist) *out_dist = (policy_matrix.empty() ? 1e300 : min_dist);
 
+    // Coverage is the row that handed out the arm at open. Re-checking
+    // containment at close would treat a drifted window as a new area and
+    // store the whole min/max span as a wide box that then swallows later
+    // regimes. A new row is created only when open found no containing row.
     int row_idx = active_train_policy_row;
     if (row_idx < 0 || row_idx >= static_cast<int>(policy_matrix.size()) ||
         policy_matrix[static_cast<size_t>(row_idx)].winner_arm < 0) {
@@ -356,16 +363,21 @@ const char* WorkloadProfiler::upsert_policy(const WorkloadFeatures& center,
                 row_idx = i;
             }
         };
-        if (index_linear_faster()) {
+        if (index_linear_faster(IndexUse::Lookup)) {
             for (size_t i = 0; i < policy_matrix.size(); ++i) consider_contain(static_cast<int>(i));
         } else {
             for (int i : index_candidates_point(center)) consider_contain(i);
         }
     }
 
-    // The row that handed out this regime's arm records the outcome, but its
-    // box is never stretched: growing a box lets one row swallow the whole
-    // feature space and the table stops gaining rows.
+    // Row existence is geographic, never a reward gate. If this regime
+    // opened from an existing row, always record that the arm was tried.
+    // Replace the row's policy only when this arm's measured score is
+    // better; a loss is still useful arm evidence.
+    //
+    // The box is deliberately not stretched on a revisit: growing one row
+    // lets it swallow the feature space and prevents genuinely new areas from
+    // receiving their own rows.
     if (row_idx >= 0) {
         PolicyRecord& src = policy_matrix[static_cast<size_t>(row_idx)];
         src.tried_arms_mask |= static_cast<uint16_t>(1u << arm);
@@ -373,53 +385,14 @@ const char* WorkloadProfiler::upsert_policy(const WorkloadFeatures& center,
             src.winner_arm = arm;
             src.best_miss_rate = miss_rate;
             src.best_delta = delta;
+            return "upsert_update_better";
         }
+        return "upsert_update_keep";
     }
 
-    // Every scored regime contributes the box it actually measured, unless a
-    // row already covers that box and did at least as well.
-    const bool cover_linear =
-        index_linear_faster() || index_box_too_wide(box_min, box_max);
-    std::vector<int> cover_cands;
-    if (!cover_linear) cover_cands = index_candidates_box(box_min, box_max);
-    auto each_cover = [&](auto fn) {
-        if (cover_linear) {
-            for (size_t i = 0; i < policy_matrix.size(); ++i) fn(static_cast<int>(i));
-        } else {
-            for (int i : cover_cands) fn(i);
-        }
-    };
-    bool skip_covered = false;
-    each_cover([&](int i) {
-        if (skip_covered) return;
-        if (i < 0 || i >= static_cast<int>(policy_matrix.size())) return;
-        const PolicyRecord& rec = policy_matrix[static_cast<size_t>(i)];
-        if (!rec.has_box || rec.winner_arm < 0) return;
-        if (box_inside_box(box_min, box_max, rec.feat_min, rec.feat_max) &&
-            rec.best_delta >= delta) {
-            skip_covered = true;
-        }
-    });
-    if (skip_covered) return "upsert_skip_covered";
-
-    std::vector<size_t> dominated;
-    each_cover([&](int i) {
-        if (i < 0 || i >= static_cast<int>(policy_matrix.size())) return;
-        const PolicyRecord& rec = policy_matrix[static_cast<size_t>(i)];
-        if (!rec.has_box || rec.winner_arm < 0) return;
-        if (box_inside_box(rec.feat_min, rec.feat_max, box_min, box_max) &&
-            delta >= rec.best_delta) {
-            dominated.push_back(static_cast<size_t>(i));
-        }
-    });
-    for (size_t i : dominated) {
-        if (i >= policy_matrix.size()) continue;
-        if (policy_matrix[i].winner_arm < 0) continue;
-        policy_matrix[i].winner_arm = -1;
-        policy_matrix[i].has_box = false;
-        policy_tombstones++;
-    }
-
+    // No row contains this area: create it regardless of win or loss. Its
+    // delta is data attached to the area, not permission for the area to
+    // exist.
     PolicyRecord rec;
     rec.features = center;
     rec.feat_min = box_min;
@@ -442,7 +415,6 @@ const char* WorkloadProfiler::upsert_policy(const WorkloadFeatures& center,
     policy_matrix.push_back(rec);
     active_train_policy_row = static_cast<int>(policy_matrix.size() - 1);
     index_insert_row(active_train_policy_row);
-    if (policy_tombstones >= 64) compact_policy_matrix();
     return "upsert_new";
 }
 
@@ -478,24 +450,19 @@ const char* WorkloadProfiler::close_current_regime(const char* reason,
         const double test_delta = test_shadow - test_mab;
         if (out_delta) *out_delta = test_delta;
         note_test_match_close(test_delta, win_reqs, win_bytes, reason);
-        return active_policy_match
-            ? (active_match_band == 0 ? "test_in_box" : "test_nearest")
-            : "test_unmatched";
+        return active_policy_match ? "test_nn" : "test_unmatched";
     }
 
     const char* action = "skip_no_score_window";
-    // The in-process 3L-Cache shadow is the baseline, so a regime only earns a
-    // row when its committed window beat that baseline by WIN_DELTA_MARGIN.
-    // Storing every committed arm regardless of the shadow is what let the
-    // table grow without bound and made the scans dominate the run.
+    // Every scored geographic area is learned. New areas create rows whether
+    // they win or lose; covered areas always record the tried arm and replace
+    // their winner only when the score improves.
     if (!phase_profile_ready) {
         action = "skip_profile_warmup";
     } else if (!phase_score_active || score_bytes == 0) {
         action = "skip_no_score_window";
     } else if (active_train_arm < 0) {
         action = "skip_uncommitted";
-    } else if (delta < WIN_DELTA_MARGIN) {
-        action = "skip_not_shadow_win";
     } else {
         double dist = 0.0;
         action = upsert_policy(last_stable_features,
@@ -503,6 +470,7 @@ const char* WorkloadProfiler::close_current_regime(const char* reason,
                                active_train_arm, mab_bmr, delta, &dist);
     }
 
+    last_regime_close_reason = reason ? reason : "";
     note_regime_close(action, delta);
     return action;
 }
@@ -527,32 +495,32 @@ const char* WorkloadProfiler::size_area_name(int idx) {
     return kNames[idx];
 }
 
-int WorkloadProfiler::match_band_index(bool in_box, bool usable,
-                                       double distance) {
+int WorkloadProfiler::match_band_index(bool usable, double distance) {
     if (!usable || !std::isfinite(distance)) return 6;
-    if (in_box) return 0;
-    // Bands follow the observed held-out range (roughly 1.0 to 6.5); the
-    // former 0.02-0.50 boundaries left six of seven buckets permanently empty.
-    if (distance <= 1.5) return 1;
-    if (distance <= 2.5) return 2;
-    if (distance <= 3.5) return 3;
-    if (distance <= 4.5) return 4;
+    // Nearest-neighbour sigma distance. No containment band.
+    if (distance <= 0.5) return 0;
+    if (distance <= 1.0) return 1;
+    if (distance <= 1.5) return 2;
+    if (distance <= 2.5) return 3;
+    if (distance <= 4.0) return 4;
     return 5;
 }
 
 const char* WorkloadProfiler::match_band_name(int idx) {
     static const char* kNames[N_MATCH_BANDS] = {
-        "in_box", "<=1.5", "1.5-2.5", "2.5-3.5",
-        "3.5-4.5", ">4.5", "unmatched"
+        "<=0.5", "0.5-1", "1-1.5", "1.5-2.5",
+        "2.5-4", ">4", "unmatched"
     };
     if (idx < 0 || idx >= N_MATCH_BANDS) return "unmatched";
     return kNames[idx];
 }
 
 void WorkloadProfiler::set_test_match_stats_paths(
-        const std::string& events_path, const std::string& stats_path) {
+        const std::string& events_path, const std::string& stats_path,
+        const std::string& nn_path) {
     test_match_events_path = events_path;
     test_match_stats_path = stats_path;
+    nn_distances_path = nn_path;
 }
 
 void WorkloadProfiler::set_test_type_stats_path(const std::string& stats_path) {
@@ -579,6 +547,7 @@ void WorkloadProfiler::note_test_match_close(double delta_bmr,
     ev.len = win_requests;
     ev.bytes = win_bytes;
     ev.match_band = active_match_band;
+    ev.nn_dist = active_nn_dist;
     ev.policy_applied = active_policy_match;
     ev.match_refused = active_match_refused;
     ev.distance =
@@ -635,7 +604,9 @@ void WorkloadProfiler::note_test_match_close(double delta_bmr,
     add(test_type[N_REGIME_TYPES][sidx]);
     add(test_type[N_REGIME_TYPES][N_SIZE_AREAS]);
 
-    if (!test_match_events_path.empty()) test_match_events.push_back(ev);
+    if (!test_match_events_path.empty() || !nn_distances_path.empty()) {
+        test_match_events.push_back(ev);
+    }
     test_stat_closes++;
     if (test_match_events.size() >= 256) {
         flush_test_match_events(false);
@@ -655,9 +626,9 @@ void WorkloadProfiler::flush_test_match_events(bool rebuild_stats) {
             std::ofstream file(test_match_events_path, std::ios::app);
             if (file.is_open()) {
                 if (!exists) {
-                    file << "avg_size,len,bytes,match_band,policy_applied,"
-                            "distance,delta_bmr,type_idx,decision,close_distance,"
-                            "close_reason,policy_row,policy_arm,"
+                    file << "avg_size,len,bytes,nearest_band,policy_applied,"
+                            "nn1,nn2,nn3,nn4,nn5,delta_bmr,type_idx,decision,"
+                            "close_distance,close_reason,policy_row,policy_arm,"
                             "policy_type_idx,inject_type_idx,"
                             "w0,w1,w2,w3";
                     for (int i = 0; i < N_FEATURES; ++i) {
@@ -676,8 +647,9 @@ void WorkloadProfiler::flush_test_match_events(bool rebuild_stats) {
                          << ev.len << ","
                          << ev.bytes << ","
                          << ev.match_band << ","
-                         << (ev.policy_applied ? 1 : 0) << ","
-                         << ev.distance << ","
+                         << (ev.policy_applied ? 1 : 0);
+                    for (double d : ev.nn_dist) file << "," << d;
+                    file << ","
                          << ev.delta_bmr << ","
                          << ev.type_idx << ","
                          << decision << ","
@@ -700,6 +672,26 @@ void WorkloadProfiler::flush_test_match_events(bool rebuild_stats) {
                 }
             }
         }
+    }
+    if (!test_match_events.empty() && !nn_distances_path.empty()) {
+        if (ensure_parent_dir(nn_distances_path)) {
+            const bool exists = std::filesystem::exists(nn_distances_path);
+            std::ofstream file(nn_distances_path, std::ios::app);
+            if (file.is_open()) {
+                if (!exists) {
+                    file << "avg_size,bytes,delta_bmr,nn1,nn2,nn3,nn4,nn5\n";
+                }
+                for (const auto& ev : test_match_events) {
+                    file << ev.avg_size << ","
+                         << ev.bytes << ","
+                         << ev.delta_bmr;
+                    for (double d : ev.nn_dist) file << "," << d;
+                    file << "\n";
+                }
+            }
+        }
+    }
+    if (!test_match_events.empty()) {
         test_match_events.clear();
     }
     if (!rebuild_stats) return;
@@ -723,7 +715,7 @@ void WorkloadProfiler::rewrite_test_match_stats() const {
     std::string tmp = test_match_stats_path + ".tmp";
     std::ofstream out(tmp, std::ios::trunc);
     if (!out.is_open()) return;
-    out << "match_band,size_area,regimes,applied,refused,apply_pct,"
+    out << "nearest_band,size_area,regimes,applied,refused,apply_pct,"
            "applied_bytes,refused_bytes,apply_bytes_pct,"
            "won,lost,win_pct,median_bmr_saved,avg_bmr_saved,"
            "byte_weighted_bmr_saved,share_of_bytes_pct\n";
@@ -874,6 +866,10 @@ void WorkloadProfiler::note_regime_close(const char* action, double delta_bmr) {
     ev.delta_bmr = delta_bmr;
     const std::string a = action ? action : "";
     ev.stored = (a == "upsert_new");
+    // Why a regime did or did not earn a row. Without this the only visible
+    // signal is the final row count, which cannot distinguish "never scored"
+    // from "merged into an existing box".
+    action_counts[a]++;
     ev.type_idx = classify_regime_type(current_features);
 
     // Live aggregates first: the summaries must not depend on the dumps.
@@ -892,13 +888,38 @@ void WorkloadProfiler::note_regime_close(const char* action, double delta_bmr) {
             else if (ev.delta_bmr < 0.0) a.lost++;
         }
         if (ev.stored) a.stored++;
+        // Floor means the regime closed on the first tick the minimum
+        // allowed. Drift and max-length are the two clock reasons.
+        if (ev.len < MIN_REGIME_LEN + REGIME_TICK) a.at_min_len++;
+        if (last_regime_close_reason == "feature_drift") a.drift_close++;
+        else if (last_regime_close_reason == "max_len") a.max_len_close++;
     };
     accumulate(train_band[sidx], true);
     accumulate(train_all, true);
-    accumulate(train_type[ev.type_idx][sidx], false);
-    accumulate(train_type[ev.type_idx][N_SIZE_AREAS], false);
-    accumulate(train_type[N_REGIME_TYPES][sidx], false);
-    accumulate(train_type[N_REGIME_TYPES][N_SIZE_AREAS], false);
+    // The arm that played this regime, scored on the bytes that produced
+    // the delta. Feature type is the row; size is not.
+    if (ev.arm_chosen &&
+        active_train_arm >= 0 && active_train_arm < N_TRAIN_ARMS &&
+        ev.type_idx >= 0 && ev.type_idx < N_REGIME_TYPES) {
+        const uint64_t scored_bytes = score_bytes;
+        auto add_arm = [&](ArmTypeAgg& cell) {
+            cell.regimes++;
+            cell.bytes += scored_bytes;
+            cell.byte_delta_sum +=
+                ev.delta_bmr * static_cast<double>(scored_bytes);
+            if (ev.delta_bmr > 0.0) {
+                cell.won++;
+                cell.win_delta_sum += ev.delta_bmr;
+            } else if (ev.delta_bmr < 0.0) {
+                cell.lost++;
+                cell.loss_delta_sum += ev.delta_bmr;
+            } else {
+                cell.draw++;
+            }
+        };
+        add_arm(arm_type[active_train_arm][ev.type_idx]);
+        add_arm(arm_type[active_train_arm][N_REGIME_TYPES]);
+    }
 
     // Reservoir of feature vectors for the p5/p95 columns.
     feature_reservoir_seen++;
@@ -1113,14 +1134,7 @@ void WorkloadProfiler::rewrite_regime_stats() const {
     const TrainAgg* bands = train_band;
     const TrainAgg& all = train_all;
 
-    auto median_d = [](std::vector<double> v) -> double {
-        if (v.empty()) return 0.0;
-        std::sort(v.begin(), v.end());
-        size_t n = v.size();
-        if (n % 2 == 1) return v[n / 2];
-        return 0.5 * (v[n / 2 - 1] + v[n / 2]);
-    };
-    auto median_u = [&](std::vector<double> v) -> uint64_t {
+    auto median_u = [](std::vector<double> v) -> uint64_t {
         if (v.empty()) return 0;
         std::sort(v.begin(), v.end());
         return static_cast<uint64_t>(v[v.size() / 2]);
@@ -1129,33 +1143,30 @@ void WorkloadProfiler::rewrite_regime_stats() const {
     std::string tmp = regime_stats_path + ".tmp";
     std::ofstream out(tmp, std::ios::trunc);
     if (!out.is_open()) return;
-    out << "area,share_of_bytes_pct,regimes_seen,long_enough_pct,arm_chosen_pct,"
-           "beat_baseline_pct,added_to_table_pct,avg_bmr_saved,median_bmr_saved,"
-           "median_regime_requests\n";
+    // Share of bytes, how many regimes closed, and how many of those regimes
+    // beat the shadow. The last four columns say whether the clock is cutting
+    // at the floor, on drift, or at the maximum length.
+    out << "area,share_of_bytes_pct,regimes,beat_3l_pct,median_requests,"
+           "at_min_len_pct,drift_close_pct,max_len_close_pct\n";
 
     const double total_bytes = static_cast<double>(all.bytes);
     auto write_band = [&](const char* name, const TrainAgg& b) {
         const double share = (total_bytes > 0.0)
             ? (100.0 * static_cast<double>(b.bytes) / total_bytes) : 0.0;
-        const double long_pct = (b.regimes > 0)
-            ? (100.0 * static_cast<double>(b.long_enough) / b.regimes) : 0.0;
-        const double arm_pct = (b.long_enough > 0)
-            ? (100.0 * static_cast<double>(b.arm_chosen) / b.long_enough) : 0.0;
-        const double beat_pct = (b.arm_chosen > 0)
-            ? (100.0 * static_cast<double>(b.beat) / b.arm_chosen) : 0.0;
-        const double store_pct = (b.arm_chosen > 0)
-            ? (100.0 * static_cast<double>(b.stored) / b.arm_chosen) : 0.0;
-        const double avg_delta = (b.delta_n > 0) ? (b.delta_sum / b.delta_n) : 0.0;
+        const double beat_pct = (b.regimes > 0)
+            ? (100.0 * static_cast<double>(b.beat) / b.regimes) : 0.0;
+        auto pct = [&](uint64_t n) -> double {
+            return (b.regimes > 0)
+                ? (100.0 * static_cast<double>(n) / b.regimes) : 0.0;
+        };
         out << name << ","
             << share << ","
             << b.regimes << ","
-            << long_pct << ","
-            << arm_pct << ","
             << beat_pct << ","
-            << store_pct << ","
-            << avg_delta << ","
-            << median_d(b.deltas.v) << ","
-            << median_u(b.lens.v) << "\n";
+            << median_u(b.lens.v) << ","
+            << pct(b.at_min_len) << ","
+            << pct(b.drift_close) << ","
+            << pct(b.max_len_close) << "\n";
     };
 
     for (int i = 0; i < N_SIZE_AREAS; ++i) {
@@ -1173,61 +1184,72 @@ void WorkloadProfiler::rewrite_regime_stats() const {
     }
 }
 
+const char* WorkloadProfiler::train_arm_name(int arm) {
+    static const char* kNames[N_TRAIN_ARMS] = {
+        "Balanced ends",
+        "Tail+",
+        "Head+",
+        "Explore",
+        "Lean middle",
+        "Lean ends"
+    };
+    if (arm < 0 || arm >= N_TRAIN_ARMS) return "unknown";
+    return kNames[arm];
+}
+
 void WorkloadProfiler::rewrite_type_stats() const {
     if (type_stats_path.empty()) return;
     if (!ensure_parent_dir(type_stats_path)) return;
 
-    // Cells: type × size-area, plus type×ALL and ALL×size and ALL×ALL.
-    // Index layout: type in [0, N_REGIME_TYPES), size in [0, N_SIZE_AREAS],
-    // where size==N_SIZE_AREAS means ALL sizes for that type.
-    auto median_d = [](std::vector<double> v) -> double {
-        if (v.empty()) return 0.0;
-        std::sort(v.begin(), v.end());
-        size_t n = v.size();
-        if (n % 2 == 1) return v[n / 2];
-        return 0.5 * (v[n / 2 - 1] + v[n / 2]);
-    };
-
-    const auto& grid = train_type;
-    const double total_bytes =
-        static_cast<double>(grid[N_REGIME_TYPES][N_SIZE_AREAS].bytes);
+    // One row per arm × feature type, then one ALL row per arm.
+    // Zero rows stay, so a type an arm never played is visible.
+    const int n_arms = std::min(N_TRAIN_ARMS,
+                                std::max(1, static_cast<int>(current_mab_k)));
 
     std::string tmp = type_stats_path + ".tmp";
     std::ofstream out(tmp, std::ios::trunc);
     if (!out.is_open()) return;
-    out << "type,area,regimes,won,lost,win_pct,median_bmr_saved,avg_bmr_saved,"
-           "share_of_bytes_pct,arm_chosen\n";
+    out << "arm,type,regimes,arm_share_of_type_pct,win_pct,draw_pct,loss_pct,"
+           "mean_win_delta,mean_loss_delta,byte_weighted_mean_delta\n";
 
-    auto write_cell = [&](const char* type_name, const char* area_name,
-                          const TrainAgg& c) {
-        const double win_pct = (c.arm_chosen > 0)
-            ? (100.0 * static_cast<double>(c.beat) / c.arm_chosen) : 0.0;
-        const double avg_delta = (c.arm_chosen > 0)
-            ? (c.delta_sum / static_cast<double>(c.arm_chosen)) : 0.0;
-        const double share = (total_bytes > 0.0)
-            ? (100.0 * static_cast<double>(c.bytes) / total_bytes) : 0.0;
-        out << type_name << ","
-            << area_name << ","
+    auto write_cell = [&](int arm, int type_idx) {
+        const ArmTypeAgg& c = arm_type[arm][type_idx];
+        uint64_t type_regimes = 0;
+        for (int a = 0; a < n_arms; ++a) {
+            type_regimes += arm_type[a][type_idx].regimes;
+        }
+        const double share = (type_regimes > 0)
+            ? (100.0 * static_cast<double>(c.regimes) / type_regimes) : 0.0;
+        const double win_pct = (c.regimes > 0)
+            ? (100.0 * static_cast<double>(c.won) / c.regimes) : 0.0;
+        const double draw_pct = (c.regimes > 0)
+            ? (100.0 * static_cast<double>(c.draw) / c.regimes) : 0.0;
+        const double loss_pct = (c.regimes > 0)
+            ? (100.0 * static_cast<double>(c.lost) / c.regimes) : 0.0;
+        const double mean_win = (c.won > 0)
+            ? (c.win_delta_sum / static_cast<double>(c.won)) : 0.0;
+        const double mean_loss = (c.lost > 0)
+            ? (c.loss_delta_sum / static_cast<double>(c.lost)) : 0.0;
+        const double byte_mean = (c.bytes > 0)
+            ? (c.byte_delta_sum / static_cast<double>(c.bytes)) : 0.0;
+        const char* type_name = (type_idx == N_REGIME_TYPES)
+            ? "ALL" : regime_type_name(type_idx);
+        out << train_arm_name(arm) << ","
+            << type_name << ","
             << c.regimes << ","
-            << c.beat << ","
-            << c.lost << ","
-            << win_pct << ","
-            << median_d(c.deltas.v) << ","
-            << avg_delta << ","
             << share << ","
-            << c.arm_chosen << "\n";
+            << win_pct << ","
+            << draw_pct << ","
+            << loss_pct << ","
+            << mean_win << ","
+            << mean_loss << ","
+            << byte_mean << "\n";
     };
 
     for (int t = 0; t < N_REGIME_TYPES; ++t) {
-        for (int s = 0; s < N_SIZE_AREAS; ++s) {
-            write_cell(regime_type_name(t), size_area_name(s), grid[t][s]);
-        }
-        write_cell(regime_type_name(t), "ALL", grid[t][N_SIZE_AREAS]);
+        for (int arm = 0; arm < n_arms; ++arm) write_cell(arm, t);
     }
-    for (int s = 0; s < N_SIZE_AREAS; ++s) {
-        write_cell("ALL", size_area_name(s), grid[N_REGIME_TYPES][s]);
-    }
-    write_cell("ALL", "ALL", grid[N_REGIME_TYPES][N_SIZE_AREAS]);
+    for (int arm = 0; arm < n_arms; ++arm) write_cell(arm, N_REGIME_TYPES);
 
     out.close();
     std::error_code ec;
@@ -1286,14 +1308,17 @@ void WorkloadProfiler::rewrite_feature_stats() const {
     std::string tmp = feature_stats_path + ".tmp";
     std::ofstream out(tmp, std::ios::trunc);
     if (!out.is_open()) return;
-    out << "feature,match,p5,p95,table_lo,table_hi,cover_pct,boxes,dead,verdict\n";
-
-    double struct_cover_sum = 0.0;
-    int struct_n = 0;
-    int struct_dead = 0;
+    // Only features the mask turned on. Cover of an off feature is the
+    // constant zero overlapping itself, which reads as healthy and is not.
+    // spread is p95-p5. box_over_spread is how many times wider the stored
+    // extremes are than that mass. flat: the feature does not move.
+    // weak: the boxes miss the mass. wide: extremes dwarf the mass.
+    out << "feature,role,spread,box_over_spread,cover_pct,verdict\n";
 
     for (int i = 0; i < N_FEATURES; ++i) {
-        const bool is_match = feature_usable(static_cast<size_t>(i));
+        if (!feature_active[i]) continue;
+        const bool usable = feature_usable(static_cast<size_t>(i));
+        const bool opens = feature_matchable(static_cast<size_t>(i));
         std::vector<double> col;
         col.reserve(samples.size());
         for (const auto& s : samples) {
@@ -1340,55 +1365,24 @@ void WorkloadProfiler::rewrite_feature_stats() const {
             cover = 100.0 * std::min(1.0, union_len(clipped) / mass);
         }
 
-        bool dead = (cover < 5.0);
-        // Constant-zero write_ratio on oracleGeneral is expected.
-        const bool ignore =
-            (i == 0 && std::abs(p5) < 1e-12 && std::abs(p95) < 1e-12);
-
-        const char* verdict = "weak";
-        if (ignore) {
-            verdict = "ignore";
-            dead = true; // still mark dead/empty, but verdict ignore
-        } else if (!is_match) {
-            verdict = "soft";
-        } else if (dead) {
-            verdict = "weak";
-        } else if (cover >= 80.0) {
-            verdict = "good";
-        } else if (cover >= 70.0) {
-            verdict = "ok";
-        } else {
-            verdict = "weak";
-        }
-
-        if (is_match) {
-            struct_n++;
-            struct_cover_sum += cover;
-            if (dead) struct_dead++;
-        }
+        const double spread = std::abs(p95 - p5);
+        const double box_span = have_box ? std::abs(table_hi - table_lo) : 0.0;
+        const double box_over = (spread > 1e-12) ? (box_span / spread) : 0.0;
+        const char* role = !usable ? "unused"
+                          : (opens ? "opens rows" : "distance only");
+        const char* verdict = "good";
+        if (spread <= 1e-12) verdict = "flat";
+        else if (cover < 5.0) verdict = "weak";
+        else if (box_over >= 4.0) verdict = "wide";
 
         out << feature_name(i) << ","
-            << (is_match ? "yes" : "no") << ","
-            << p5 << ","
-            << p95 << ","
-            << (have_box ? table_lo : 0.0) << ","
-            << (have_box ? table_hi : 0.0) << ","
+            << role << ","
+            << spread << ","
+            << box_over << ","
             << cover << ","
-            << boxes_touch << ","
-            << (dead ? "yes" : "no") << ","
             << verdict << "\n";
     }
 
-    const double all_cover = (struct_n > 0) ? (struct_cover_sum / struct_n) : 0.0;
-    const char* all_verdict =
-        (struct_dead == 0 && all_cover >= 80.0) ? "ready" :
-        (struct_dead == 0 && all_cover >= 70.0) ? "ok" : "not_ready";
-
-    // feature,match,p5,p95,table_lo,table_hi,cover_pct,boxes,dead,verdict
-    out << "ALL_STRUCTURAL,,,,,,"
-        << all_cover << ",,"
-        << "dead=" << struct_dead << "/" << struct_n << ","
-        << all_verdict << "\n";
     out.close();
 
     std::error_code ec;
@@ -1428,6 +1422,8 @@ void WorkloadProfiler::init(const std::string& mode_str,
     if (active_count < 3) {
         throw std::runtime_error("feature-mask must enable at least 3 features");
     }
+    feature_mask_str = feature_mask;
+    rebuild_active_index();
     current_mab_k = mab_k;
     policy_filename = policy_file;
     config_filename = config_file;
@@ -1459,7 +1455,8 @@ void WorkloadProfiler::init(const std::string& mode_str,
         set_test_match_stats_paths(
             persist_event_logs ? (test_dir / "match_events.csv").string()
                                : std::string(),
-            (test_dir / "match_stats.csv").string());
+            (test_dir / "match_stats.csv").string(),
+            (test_dir / "nn_distances.csv").string());
         set_test_type_stats_path((test_dir / "type_stats.csv").string());
     } else { 
         current_mode = ProfilerMode::TRAIN;
@@ -1495,7 +1492,69 @@ void WorkloadProfiler::init(const std::string& mode_str,
     }
 }
 
+void WorkloadProfiler::rebuild_active_index() {
+    active_idx.clear();
+    for (size_t i = 0; i < 15; ++i) {
+        if (feature_active[i]) active_idx.push_back(i);
+    }
+    need_reuse_distance = feature_active[7];
+    need_working_set = feature_active[13];
+    need_time_features =
+        feature_active[10] || feature_active[11] || feature_active[12];
+}
+
+void WorkloadProfiler::scale_reservoir_add(const std::vector<double>& v) {
+    scale_seen++;
+    if (scale_reservoir.size() < SCALE_RESERVOIR_CAP) {
+        scale_reservoir.push_back(v);
+        return;
+    }
+    stats_rng ^= stats_rng << 13;
+    stats_rng ^= stats_rng >> 7;
+    stats_rng ^= stats_rng << 17;
+    const uint64_t j = stats_rng % scale_seen;
+    if (j < SCALE_RESERVOIR_CAP) {
+        scale_reservoir[static_cast<size_t>(j)] = v;
+    }
+}
+
+// Sigma from the spread of tick samples rather than from consecutive-sample
+// deltas. Two neighbouring samples of a rolling-window feature are nearly
+// identical no matter how far apart they are taken, so a delta-based
+// estimator always collapses; a quantile spread over the whole trace does not.
+void WorkloadProfiler::refresh_feature_scale() {
+    if (scale_reservoir.size() < SCALE_MIN_SAMPLES) return;
+    std::vector<double> col;
+    col.reserve(scale_reservoir.size());
+    for (size_t f : active_idx) {
+        col.clear();
+        for (const auto& s : scale_reservoir) {
+            if (f < s.size() && std::isfinite(s[f])) col.push_back(s[f]);
+        }
+        if (col.size() < SCALE_MIN_SAMPLES) continue;
+        scale_ready = true;
+        std::sort(col.begin(), col.end());
+        const size_t n = col.size();
+        const double p16 = col[static_cast<size_t>(0.16 * (n - 1))];
+        const double p50 = col[n / 2];
+        const double p84 = col[static_cast<size_t>(0.84 * (n - 1))];
+        feature_means[f] = p50;
+        const double spread = 0.5 * (p84 - p16);
+        feature_scale[f] = std::max(std::isfinite(spread) ? spread : 0.0,
+                                    loaded_scale[f]);
+        // Keep the v2 config field consistent for anything still reading it.
+        feature_vars[f] = feature_scale[f] * feature_scale[f];
+    }
+}
+
 double WorkloadProfiler::feature_std(size_t i) const {
+    if (scale_ready || feature_scale_loaded) {
+        const double s = feature_scale[i];
+        if (std::isfinite(s) && s > 0.0) return s;
+        const double rel = std::abs(feature_means[i]) * FEATURE_STD_REL_FLOOR;
+        return std::max(rel, std::sqrt(FEATURE_VAR_FLOOR));
+    }
+    // Bootstrap before the reservoir has enough samples.
     const double var = (std::isfinite(feature_vars[i]) && feature_vars[i] > 0.0)
         ? feature_vars[i] : FEATURE_VAR_FLOOR;
     const double sd = std::sqrt(std::max(var, FEATURE_VAR_FLOOR));
@@ -1505,9 +1564,14 @@ double WorkloadProfiler::feature_std(size_t i) const {
 
 bool WorkloadProfiler::feature_usable(size_t i) const {
     if (!feature_active[i]) return false;
-    // The EMA variance of a constant feature decays until it is pinned at the
-    // floor, so a value still sitting on the floor means no observed spread.
-    return feature_vars[i] > FEATURE_VAR_FLOOR;
+    // Usable means "this feature actually moves across the workload". The
+    // spread is measured over the whole trace, so a feature is only dropped
+    // when it is genuinely constant (write_ratio on a read-only trace), not
+    // merely slow-moving, which is what the old per-request EWMA punished.
+    if (!scale_ready && !feature_scale_loaded) return true;
+    const double eps =
+        std::max(std::abs(feature_means[i]) * FEATURE_SPREAD_REL_EPS, 1e-12);
+    return feature_scale[i] > eps;
 }
 
 bool WorkloadProfiler::feature_matchable(size_t i) const {
@@ -1542,10 +1606,14 @@ uint64_t WorkloadProfiler::index_pack(int a, int b, int c) {
     return u(a) | (u(b) << 21) | (u(c) << 42);
 }
 
-bool WorkloadProfiler::index_linear_faster() const {
-    // TRAIN must see every stored street. Missing one row here inserts a
-    // duplicate and the table never settles. TEST may use the grid.
-    if (current_mode == ProfilerMode::TRAIN) return true;
+bool WorkloadProfiler::index_linear_faster(IndexUse use) const {
+    // A missed row in the coverage test inserts a duplicate and the table
+    // never settles, so that scan stays exhaustive in TRAIN. It runs only on
+    // a stored close. Regime-open lookup runs on every regime and may use the
+    // grid in either mode.
+    if (use == IndexUse::Cover && current_mode == ProfilerMode::TRAIN) {
+        return true;
+    }
     const size_t n = policy_matrix.size();
     if (n <= 48) return true;
     return policy_wide.size() * 4 >= n;
@@ -1683,14 +1751,17 @@ void WorkloadProfiler::clamp_thresholds() {
 }
 
 void WorkloadProfiler::update_online_threshold(double current_delta) {
-    // Held-out TEST keeps the trained regime clock fixed.
-    if (current_mode == ProfilerMode::TEST) return;
+    // TRAIN and TEST use the same unsupervised clock. Freezing the final
+    // TRAIN threshold made mask-dependent values such as 0.04 and 1.0 split
+    // the same TEST trace into 6,000 versus 600 regimes. Adapting here reads
+    // feature motion only—never cache misses, shadow outcomes, or rewards—so
+    // it aligns segmentation without fitting to TEST performance.
     double diff = current_delta - ema_delta_mean;
     ema_delta_mean += alpha * diff;
     ema_delta_var = (1.0 - alpha) * (ema_delta_var + alpha * diff * diff);
     
     double std_dev = std::sqrt(std::max(0.0, ema_delta_var));
-    shift_threshold = ema_delta_mean + (3.0 * std_dev);
+    shift_threshold = ema_delta_mean + (shift_sigma * std_dev);
     matrix_epsilon = std::max(0.01, ema_delta_mean * 0.5);
     // A drifting ruler used to push these into the hundreds, so feature drift
     // never fired and almost nothing reached an upsert.
@@ -1701,7 +1772,7 @@ void WorkloadProfiler::update_feature_statistics(const WorkloadFeatures& f) {
     // Held-out TEST must keep the training distance ruler fixed.
     if (current_mode == ProfilerMode::TEST) return;
     auto vec = to_vector(f);
-    for (size_t i = 0; i < 15; ++i) {
+    for (size_t i : active_idx) {
         double diff = vec[i] - feature_means[i];
         feature_means[i] += alpha * diff;
         double var = (1.0 - alpha) * (feature_vars[i] + alpha * diff * diff);
@@ -1717,7 +1788,7 @@ double WorkloadProfiler::calculate_aggregate_distance(const WorkloadFeatures& f1
     double weighted_sum = 0.0;
     double total_weight = 0.0;
     
-    for (size_t i = 0; i < 15; ++i) {
+    for (size_t i : active_idx) {
         if (!feature_usable(i)) continue;
         double norm_diff = std::min(MAX_NORM_DIFF,
                                     std::abs(v1[i] - v2[i]) / feature_std(i));
@@ -1734,8 +1805,9 @@ void WorkloadProfiler::save_config() {
     std::string tmp = config_filename + ".tmp";
     std::ofstream file(tmp, std::ios::trunc);
     if (!file.is_open()) return;
-    // v2: thresholds + feature scale used by distance / match bands.
-    file << "v2\n";
+    // v3: thresholds + the robust ruler (median and 1-sigma spread) used by
+    // distance / match bands. v2 stored an EWMA variance instead.
+    file << "v3\n";
     file << shift_threshold << "\n";
     file << matrix_epsilon << "\n";
     for (int i = 0; i < 15; ++i) {
@@ -1745,7 +1817,7 @@ void WorkloadProfiler::save_config() {
     file << "\n";
     for (int i = 0; i < 15; ++i) {
         if (i) file << " ";
-        file << feature_vars[i];
+        file << feature_scale[i];
     }
     file << "\n";
     file.close();
@@ -1771,19 +1843,26 @@ void WorkloadProfiler::load_config() {
     std::string first;
     if (!(file >> first)) return;
 
-    // New format starts with "v2"; old format started with a float threshold.
-    if (first == "v2") {
+    // v3 stores the robust sigma directly; v2 stored an EWMA variance whose
+    // square root is the closest equivalent. Old format started with a float.
+    if (first == "v2" || first == "v3") {
+        const bool v3 = (first == "v3");
         if (!(file >> shift_threshold)) return;
         if (!(file >> matrix_epsilon)) return;
         for (int i = 0; i < 15; ++i) {
             if (!(file >> feature_means[i])) return;
         }
         for (int i = 0; i < 15; ++i) {
-            if (!(file >> feature_vars[i])) return;
-            if (!(feature_vars[i] > 0.0) || !std::isfinite(feature_vars[i])) {
-                feature_vars[i] = 1.0;
-            }
-            feature_vars[i] = std::max(feature_vars[i], FEATURE_VAR_FLOOR);
+            double x = 0.0;
+            if (!(file >> x)) return;
+            if (!std::isfinite(x) || x < 0.0) x = 0.0;
+            // A v2 variance pinned at the floor means the old estimator gave
+            // up on the feature; carry that through as "no spread" rather
+            // than inventing a sigma of 0.01.
+            if (!v3) x = (x <= FEATURE_VAR_FLOOR) ? 0.0 : std::sqrt(x);
+            feature_scale[i] = x;
+            loaded_scale[i] = x;
+            feature_vars[i] = (x > 0.0) ? x * x : 1.0;
         }
         feature_scale_loaded = true;
         clamp_thresholds();
@@ -1802,11 +1881,14 @@ void WorkloadProfiler::load_config() {
             bool ok = true;
             for (int i = 1; i < 15 && ok; ++i) ok = static_cast<bool>(file >> feature_means[i]);
             for (int i = 0; i < 15 && ok; ++i) {
-                ok = static_cast<bool>(file >> feature_vars[i]);
-                if (ok && (!(feature_vars[i] > 0.0) || !std::isfinite(feature_vars[i]))) {
-                    feature_vars[i] = 1.0;
-                }
-                if (ok) feature_vars[i] = std::max(feature_vars[i], FEATURE_VAR_FLOOR);
+                double x = 0.0;
+                ok = static_cast<bool>(file >> x);
+                if (!ok) break;
+                if (!std::isfinite(x) || x <= FEATURE_VAR_FLOOR) x = 0.0;
+                else x = std::sqrt(x);
+                feature_scale[i] = x;
+                loaded_scale[i] = x;
+                feature_vars[i] = (x > 0.0) ? x * x : 1.0;
             }
             if (ok) feature_scale_loaded = true;
         }
@@ -1824,6 +1906,17 @@ void WorkloadProfiler::write_features_csv(std::ostream& file,
          << f.arrival_time_variance << "," << f.working_set_byte_delta << "," << f.scan_ratio;
 }
 
+void WorkloadProfiler::write_active_csv(std::ostream& file,
+                                        const WorkloadFeatures& f) const {
+    const auto v = to_vector(f);
+    bool first = true;
+    for (size_t i : active_idx) {
+        if (!first) file << ",";
+        first = false;
+        file << v[i];
+    }
+}
+
 void WorkloadProfiler::save_policy_matrix() {
     if (policy_filename.empty()) return;
 
@@ -1833,13 +1926,17 @@ void WorkloadProfiler::save_policy_matrix() {
     std::ofstream file(tmp, std::ios::trunc);
     if (!file.is_open()) return;
 
-    file << "knn_v6,box_min_15,box_max_15,winner_arm,best_miss_rate,"
-            "best_delta,q0,q1,q2,q3,q4,q5,queue_next,tried_arms_mask\n";
+    // v8 stores the box over the mask's features only. Row creation is
+    // geography-only; reward updates the policy attached to an existing row.
+    // The other coordinates are never read by distance or containment.
+    file << "knn_v8,mask=" << feature_mask_str
+         << ",box_min_active,box_max_active,winner_arm,best_miss_rate,"
+            "best_delta,queue,queue_next,tried_arms_mask\n";
     for (const auto& record : policy_matrix) {
-        file << "knn_v6,box,";
-        write_features_csv(file, record.feat_min);
+        file << "knn_v8,box,";
+        write_active_csv(file, record.feat_min);
         file << ",";
-        write_features_csv(file, record.feat_max);
+        write_active_csv(file, record.feat_max);
         file << "," << record.winner_arm
              << "," << record.best_miss_rate
              << "," << record.best_delta;
@@ -1877,19 +1974,33 @@ void WorkloadProfiler::load_policy_matrix() {
     std::ifstream file(policy_filename);
     if (!file.is_open()) return;
 
+    const std::string row_tag = "knn_v8,box,";
+    const std::string want_hdr = "knn_v8,mask=" + feature_mask_str + ",";
+    const size_t nf = active_idx.size();
+
     std::string line;
     size_t rejected_old_rows = 0;
+    bool mask_mismatch = false;
     while (std::getline(file, line)) {
         if (line.empty()) continue;
-        if (line.rfind("knn_v6,box_min_15,", 0) == 0) continue;
-        if (line.rfind("knn_v6,box,", 0) != 0) {
+        if (line.rfind("knn_v8,mask=", 0) == 0) {
+            // A table built under a different mask has a different column
+            // meaning per row; loading it would silently compare unrelated
+            // coordinates. Drop it and start fresh.
+            if (line.rfind(want_hdr, 0) != 0) {
+                mask_mismatch = true;
+                break;
+            }
+            continue;
+        }
+        if (line.rfind(row_tag, 0) != 0) {
             ++rejected_old_rows;
             continue;
         }
 
         PolicyRecord record;
         std::vector<double> all_nums;
-        std::stringstream ss(line.substr(std::string("knn_v6,box,").size()));
+        std::stringstream ss(line.substr(row_tag.size()));
         std::string val;
         bool bad = false;
         while (std::getline(ss, val, ',')) {
@@ -1903,27 +2014,29 @@ void WorkloadProfiler::load_policy_matrix() {
         if (bad) continue;
 
         const int k = std::max(1, static_cast<int>(current_mab_k));
-        // 15 min + 15 max + winner + miss + delta + queue[k] + next + mask.
-        if (static_cast<int>(all_nums.size()) != 35 + k) continue;
-        from_vector(std::vector<double>(all_nums.begin(), all_nums.begin() + 15),
-                    record.feat_min);
-        from_vector(std::vector<double>(all_nums.begin() + 15, all_nums.begin() + 30),
-                    record.feat_max);
-        auto lo = to_vector(record.feat_min);
-        auto hi = to_vector(record.feat_max);
-        std::vector<double> mid(15);
-        for (size_t i = 0; i < 15; ++i) mid[i] = 0.5 * (lo[i] + hi[i]);
+        // nf min + nf max + winner + miss + delta + queue[k] + next + mask.
+        const size_t base = 2 * nf;
+        if (all_nums.size() != base + 5 + static_cast<size_t>(k)) continue;
+        std::vector<double> lo(15, 0.0), hi(15, 0.0), mid(15, 0.0);
+        for (size_t j = 0; j < nf; ++j) {
+            const size_t i = active_idx[j];
+            lo[i] = all_nums[j];
+            hi[i] = all_nums[nf + j];
+            mid[i] = 0.5 * (lo[i] + hi[i]);
+        }
+        from_vector(lo, record.feat_min);
+        from_vector(hi, record.feat_max);
         from_vector(mid, record.features);
         record.has_box = true;
-        record.winner_arm = static_cast<int>(all_nums[30]);
-        record.best_miss_rate = all_nums[31];
-        record.best_delta = all_nums[32];
+        record.winner_arm = static_cast<int>(all_nums[base]);
+        record.best_miss_rate = all_nums[base + 1];
+        record.best_delta = all_nums[base + 2];
         bool queue_ok = record.winner_arm >= -1 &&
                         record.winner_arm < k;
         std::vector<bool> seen(static_cast<size_t>(k), false);
         record.arm_queue.assign(static_cast<size_t>(k), 0);
         for (int i = 0; i < k; ++i) {
-            const int arm = static_cast<int>(all_nums[33 + i]);
+            const int arm = static_cast<int>(all_nums[base + 3 + static_cast<size_t>(i)]);
             if (arm < 0 || arm >= k || seen[static_cast<size_t>(arm)]) {
                 queue_ok = false;
                 break;
@@ -1931,9 +2044,10 @@ void WorkloadProfiler::load_policy_matrix() {
             seen[static_cast<size_t>(arm)] = true;
             record.arm_queue[static_cast<size_t>(i)] = static_cast<uint8_t>(arm);
         }
-        record.queue_next = static_cast<uint8_t>(all_nums[33 + k]);
+        record.queue_next =
+            static_cast<uint8_t>(all_nums[base + 3 + static_cast<size_t>(k)]);
         record.tried_arms_mask =
-            static_cast<uint16_t>(all_nums[34 + k]);
+            static_cast<uint16_t>(all_nums[base + 4 + static_cast<size_t>(k)]);
         const uint16_t valid_mask =
             static_cast<uint16_t>((1u << static_cast<unsigned>(k)) - 1u);
         if (!queue_ok || record.queue_next >= static_cast<uint8_t>(k)) continue;
@@ -1948,10 +2062,15 @@ void WorkloadProfiler::load_policy_matrix() {
         }
     }
     file.close();
-    if (rejected_old_rows > 0) {
+    if (mask_mismatch) {
+        policy_matrix.clear();
+        std::cerr << "KNN policy feature-mask mismatch in " << policy_filename
+                  << "; starting fresh for mask " << feature_mask_str
+                  << std::endl;
+    } else if (rejected_old_rows > 0) {
         std::cerr << "KNN policy schema mismatch: ignored "
                   << rejected_old_rows
-                  << " old row(s); start fresh with knn_v6" << std::endl;
+                  << " old row(s); start fresh with knn_v8" << std::endl;
     }
     compact_policy_matrix();
     rebuild_policy_index();
@@ -1982,60 +2101,60 @@ std::vector<double> WorkloadProfiler::find_closest_policy(
             record_contains(current, policy_matrix[static_cast<size_t>(i)])
         });
     };
-    if (index_linear_faster()) {
+    if (index_linear_faster(IndexUse::Lookup)) {
         for (size_t i = 0; i < policy_matrix.size(); ++i) add_cand(static_cast<int>(i));
     } else {
         for (int i : index_candidates_point(current)) add_cand(i);
     }
-    std::sort(candidates.begin(), candidates.end(),
-              [](const Candidate& a, const Candidate& b) {
-                  if (a.contained != b.contained) return a.contained > b.contained;
-                  if (std::abs(a.dist - b.dist) > 1e-12) return a.dist < b.dist;
-                  return a.idx < b.idx;
-              });
     if (candidates.empty()) {
         last_match_dist = 1e300;
         return std::vector<double>();
     }
+    // Only the nearest five contribute. Containment remains an audit signal,
+    // not a ranking override: a broad box must not outrank a much closer
+    // regime merely because the current point lies inside its padded bounds.
+    const auto by_rank = [](const Candidate& a, const Candidate& b) {
+        if (std::abs(a.dist - b.dist) > 1e-12) return a.dist < b.dist;
+        if (a.contained != b.contained) return a.contained > b.contained;
+        return a.idx < b.idx;
+    };
+    const size_t keep = std::min<size_t>(5, candidates.size());
+    std::partial_sort(candidates.begin(), candidates.begin() + keep,
+                      candidates.end(), by_rank);
     const bool in_box = candidates.front().contained;
     const int best_idx = candidates.front().idx;
     const double best_dist = candidates.front().dist;
     if (out_in_box) *out_in_box = in_box;
     if (out_policy_row) *out_policy_row = best_idx;
     last_match_dist = best_dist;
-    std::vector<double> votes(current_mab_k, 0.0);
+    active_nn_dist.fill(-1.0);
+    std::vector<double> blend(current_mab_k, 0.0);
     const size_t count = std::min<size_t>(5, candidates.size());
     for (size_t i = 0; i < count; ++i) {
         const PolicyRecord& rec =
             policy_matrix[static_cast<size_t>(candidates[i].idx)];
-        int tried = 0;
-        uint16_t mask = rec.tried_arms_mask;
-        while (mask != 0) {
-            tried += static_cast<int>(mask & 1u);
-            mask >>= 1u;
-        }
-        // A demonstrated win is useful immediately, even if the row has not
-        // completed all six arms. Only losing rows are discounted for partial
-        // coverage. 1/(1+d) avoids a singular in-box vote while making every
-        // finite-distance neighbor eligible; distant rows fade naturally.
-        const double coverage =
-            static_cast<double>(tried) /
-            std::max(1.0, static_cast<double>(current_mab_k));
-        const double confidence =
-            (rec.best_delta > 0.0) ? 1.0 : coverage;
-        const double vote =
-            confidence / (1.0 + std::max(0.0, candidates[i].dist));
-        votes[static_cast<size_t>(rec.winner_arm)] += vote;
+        active_nn_dist[i] = candidates[i].dist;
+        // Distance only. The 0.05 offset keeps a zero-distance row finite.
+        // best_delta already chose this row's stored arm; it does not vote.
+        const double d = 0.05 + std::max(0.0, candidates[i].dist);
+        const double weight = 1.0 / (d * d);
+        if (rec.winner_arm < 0 ||
+            rec.winner_arm >= static_cast<int>(blend.size())) continue;
+        blend[static_cast<size_t>(rec.winner_arm)] += weight;
     }
-    int winner = 0;
-    for (int arm = 1; arm < static_cast<int>(current_mab_k); ++arm) {
-        if (votes[static_cast<size_t>(arm)] >
-            votes[static_cast<size_t>(winner)]) winner = arm;
+
+    double total = 0.0;
+    for (double value : blend) total += value;
+    if (total <= 0.0) {
+        // No usable neighbour arm. Replay the closest stored arm.
+        blend.assign(current_mab_k, 0.0);
+        const int fallback =
+            policy_matrix[static_cast<size_t>(best_idx)].winner_arm;
+        blend[static_cast<size_t>(fallback)] = 1.0;
+    } else {
+        for (double& value : blend) value /= total;
     }
-    std::vector<double> w(current_mab_k, 0.01);
-    w[static_cast<size_t>(winner)] = 1.0;
-    normalize_weights(w);
-    return w;
+    return blend;
 }
 
 uint8_t WorkloadProfiler::select_regime_arm(bool* out_matched) {
@@ -2060,7 +2179,7 @@ uint8_t WorkloadProfiler::select_regime_arm(bool* out_matched) {
                 row_idx = i;
             }
         };
-        if (index_linear_faster()) {
+        if (index_linear_faster(IndexUse::Lookup)) {
             for (size_t i = 0; i < policy_matrix.size(); ++i) consider(static_cast<int>(i));
         } else {
             for (int i : index_candidates_point(current_features)) consider(i);
@@ -2106,6 +2225,7 @@ uint8_t WorkloadProfiler::select_regime_arm(bool* out_matched) {
         active_match_refused = false;
         active_match_dist = 1e300;
         active_match_band = N_MATCH_BANDS - 1;
+        active_nn_dist.fill(-1.0);
         active_policy_row = -1;
         active_policy_arm = 3;
         active_policy_type = classify_regime_type(current_features);
@@ -2117,10 +2237,9 @@ uint8_t WorkloadProfiler::select_regime_arm(bool* out_matched) {
         return 3;
     }
 
-    bool in_box = false;
     int policy_row = -1;
     std::vector<double> matched =
-        find_closest_policy(current_features, &in_box, &policy_row);
+        find_closest_policy(current_features, nullptr, &policy_row);
     int winner = 3; // Empty table/no completed TRAIN row: Explore.
     const bool usable = !matched.empty();
     if (usable) {
@@ -2136,16 +2255,15 @@ uint8_t WorkloadProfiler::select_regime_arm(bool* out_matched) {
     // with distant rows receiving less weight.
     active_match_refused = false;
     active_match_dist = matched.empty() ? 1e300 : last_match_dist;
-    active_match_band = match_band_index(in_box, !matched.empty(), active_match_dist);
+    if (matched.empty()) active_nn_dist.fill(-1.0);
+    active_match_band = match_band_index(!matched.empty(), active_match_dist);
     active_policy_row = policy_row;
     active_policy_arm = winner;
     active_policy_type =
         (policy_row >= 0 && policy_row < static_cast<int>(policy_matrix.size()))
         ? classify_regime_type(policy_matrix[static_cast<size_t>(policy_row)].features)
         : N_REGIME_TYPES - 1;
-    active_policy_weights.assign(current_mab_k, 0.01);
-    active_policy_weights[static_cast<size_t>(winner)] = 1.0;
-    normalize_weights(active_policy_weights);
+    active_policy_weights = matched;
     active_inject_features = current_features;
     phase_score_active = true;
     score_requests = score_bytes = score_miss_bytes = score_shadow_miss_bytes = 0;
@@ -2169,9 +2287,15 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
     // because any size >= 1 admits last_id + 1.
     bool is_seq = (local_seq > 0 && id > last_id &&
                    id <= last_id + static_cast<uint64_t>(last_size));
+    // last_seen_seq is a per-object map touched on every request and exists
+    // only to feed avg_reuse_distance. When the mask drops that feature the
+    // whole map goes with it.
     double r_dist = 0.0;
-    if (last_seen_seq.find(id) != last_seen_seq.end()) {
-        r_dist = static_cast<double>(local_seq - last_seen_seq[id]);
+    if (need_reuse_distance) {
+        auto it = last_seen_seq.find(id);
+        if (it != last_seen_seq.end()) {
+            r_dist = static_cast<double>(local_seq - it->second);
+        }
     }
     bool first_time = (id_counts[id] == 0);
 
@@ -2181,11 +2305,15 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
     if (out_cache_hit) out_cache_hits++;
     if (is_seq) sequential_count++;
     if (r_dist > 0.0) { total_reuse_dist += r_dist; reuse_count++; }
-    if (dt > 0.0) { dt_sum += dt; dt_sq_sum += dt * dt; dt_count++; }
+    if (need_time_features && dt > 0.0) {
+        dt_sum += dt; dt_sq_sum += dt * dt; dt_count++;
+    }
     if (first_time) { 
         first_time_seen_count++; 
+        if (need_working_set) {
         unique_id_sizes[id] = size;
         working_set_bytes += size; 
+        }
     }
 
     size_t current_f = id_counts[id];
@@ -2197,7 +2325,7 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
     if (new_f == 1) singleton_count++;
 
     id_counts[id]++;
-    last_seen_seq[id] = local_seq;
+    if (need_reuse_distance) last_seen_seq[id] = local_seq;
     window.push_back({id, size, is_write, timestamp, out_cache_hit, r_dist, is_seq, dt, first_time});
     
     last_id = id;
@@ -2215,7 +2343,9 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
         if (old.out_cache_hit) out_cache_hits--;
         if (old.is_sequential) sequential_count--;
         if (old.reuse_dist > 0.0) { total_reuse_dist -= old.reuse_dist; reuse_count--; }
-        if (old.dt > 0.0) { dt_sum -= old.dt; dt_sq_sum -= old.dt * old.dt; dt_count--; }
+        if (need_time_features && old.dt > 0.0) {
+            dt_sum -= old.dt; dt_sq_sum -= old.dt * old.dt; dt_count--;
+        }
         if (old.first_time) first_time_seen_count--;
 
         size_t old_f = id_counts[old.id];
@@ -2229,15 +2359,87 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
         id_counts[old.id]--;
         if (id_counts[old.id] == 0) {
             id_counts.erase(old.id);
-            working_set_bytes -= unique_id_sizes[old.id];
-            unique_id_sizes.erase(old.id);
+            if (need_working_set) {
+                auto us = unique_id_sizes.find(old.id);
+                if (us != unique_id_sizes.end()) {
+                    working_set_bytes -= us->second;
+                    unique_id_sizes.erase(us);
+                }
+            }
         }
     }
 
-    recalculate_features();
-    update_feature_statistics(current_features);
+    // Byte shock is now counted, not acted on. One outsized request used to
+    // be able to close a regime on its own, which is half of why the median
+    // regime length was a single request.
+    const bool byte_shock = (shock_ref_size > 0.0 &&
+                             static_cast<double>(size) >
+                                 SHOCK_SIZE_MULT * shock_ref_size);
+    if (byte_shock) phase_shock_count++;
 
-    if (local_seq % 1000 == 0 && local_seq > 1000) {
+    // The decision clock. Everything above this point is O(1) per request;
+    // everything below runs once per REGIME_TICK requests.
+    const bool tick = (local_seq % REGIME_TICK) == 0;
+    if (!tick) {
+        request_counter++;
+        phase_requests++;
+        phase_bytes += size;
+        if (is_miss) { phase_misses++; phase_miss_bytes += size; }
+        if (shadow_is_miss) {
+            phase_shadow_misses++;
+            phase_shadow_miss_bytes += size;
+        }
+        // The score window and the stable weights must follow the requests,
+        // not the clock: the stored policy is whatever the arm was running
+        // when the regime ended, and the delta must cover every committed
+        // request rather than only those that landed on a tick.
+        if (current_mode == ProfilerMode::TRAIN && arm_committed &&
+            !phase_score_active) {
+            phase_score_active = true;
+            score_requests = 0;
+            score_bytes = 0;
+            score_miss_bytes = 0;
+            score_shadow_miss_bytes = 0;
+        }
+        if (phase_score_active) {
+            score_requests++;
+            score_bytes += size;
+            if (is_miss) score_miss_bytes += size;
+            if (shadow_is_miss) score_shadow_miss_bytes += size;
+        }
+        if (arm_committed) {
+            last_stable_features = current_features;
+            last_stable_weights = current_weights;
+            normalize_weights(last_stable_weights);
+        }
+        if (current_mode == ProfilerMode::TRAIN) {
+            train_total_reqs++;
+            if (is_miss) train_total_misses++;
+        }
+        if (phase_requests >= MIN_REGIME_LEN) phase_box_frozen = true;
+        return false;
+    }
+
+    tick_counter++;
+    recalculate_features();
+    if (!scale_ready && !feature_scale_loaded) {
+    update_feature_statistics(current_features);
+    }
+    if (current_mode == ProfilerMode::TRAIN) {
+        scale_reservoir_add(to_vector(current_features));
+        ++ticks_since_scale;
+        // Take the ruler as soon as there are enough samples to trust it,
+        // then re-derive it rarely: the sort is the only super-linear work
+        // left on this path.
+        const bool first_ruler =
+            (!scale_ready && scale_reservoir.size() >= SCALE_MIN_SAMPLES);
+        if (first_ruler || ticks_since_scale >= SCALE_REFRESH_TICKS) {
+            ticks_since_scale = 0;
+            refresh_feature_scale();
+        }
+    }
+
+    if (tick_counter > 1) {
         double delta = calculate_aggregate_distance(current_features, prev_window_features);
         update_online_threshold(delta);
         prev_window_features = current_features;
@@ -2266,23 +2468,51 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
             if (out_regime_reset) *out_regime_reset = true;
         }
     }
+    phase_ticks++;
     double current_shift = calculate_aggregate_distance(current_features, phase_start_features);
+
+    // The area is the min/max collected over the first MIN_REGIME_LEN
+    // requests. After that, a tick outside that range is a new regime.
+    // Two such ticks are required so one noisy sample does not cut it.
+    const bool shock_tick =
+        (phase_shock_count >
+         static_cast<uint64_t>(SHOCK_TICK_SHARE * REGIME_TICK));
+    const bool outside_box = phase_box_frozen &&
+        !point_in_box(current_features, phase_box_min, phase_box_max);
+    if (outside_box || shock_tick) {
+        drift_ticks++;
+    } else {
+        drift_ticks = 0;
+    }
+    phase_shock_count = 0;
+
+    const bool drift_confirmed =
+        (drift_ticks >= DRIFT_CONFIRM && phase_requests >= MIN_REGIME_LEN);
+    // A perfectly stable trace would otherwise never produce a second
+    // training sample.
+    const bool too_long = (phase_requests >= MAX_REGIME_LEN);
     bool feature_regime_reset =
-        (!warmup_reset && phase_requests > 0 &&
-         current_shift > shift_threshold);
+        (!warmup_reset && phase_requests > 0 && (drift_confirmed || too_long));
+    if (feature_regime_reset) drift_ticks = 0;
     const char* drift_action = nullptr;
     double drift_delta = 0.0;
     std::vector<double> closed_weights;
     if (feature_regime_reset) {
-        last_regime_close_reason = "feature_drift";
+        const char* why = too_long ? "max_len" : "feature_drift";
+        last_regime_close_reason = why;
         closed_weights = last_stable_weights;
-        drift_action = close_current_regime("feature_drift", &drift_delta);
+        drift_action = close_current_regime(why, &drift_delta);
         open_new_regime();
         if (out_regime_reset) *out_regime_reset = true;
     }
-    expand_box(phase_box_min, phase_box_max, current_features);
+    // The first minimum-length window defines the area. Requests after that
+    // stay on the same regime until a feature leaves that saved range.
+    if (!phase_box_frozen) {
+        expand_box(phase_box_min, phase_box_max, current_features);
+    }
 
-        phase_requests++;
+    phase_requests++;
+    if (phase_requests >= MIN_REGIME_LEN) phase_box_frozen = true;
     phase_bytes += size;
     if (is_miss) {
         phase_misses++;
@@ -2329,11 +2559,8 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
         }
 
         // Feature clock only. Arm weight moves do NOT close the regime, and
-        // neither does elapsed length: a stable regime stays open.
-        double avg_sz = current_features.avg_request_size;
-        bool byte_shock = (avg_sz > 0.0 &&
-                           static_cast<double>(size) > SHOCK_SIZE_MULT * avg_sz);
-
+        // byte shock is folded into the tick drift vote above rather than
+        // cutting the regime here.
         if (feature_regime_reset && train_log.enabled()) {
             train_log.log_learning(local_seq, drift_action,
                                    policy_matrix.size(), drift_delta,
@@ -2341,24 +2568,6 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
         }
         // Policy is saved at trace end. Rewriting the whole table on every
         // stored close is what made a growing file stall the run on /mnt/c.
-
-        if (byte_shock && phase_requests > 0) {
-            last_regime_close_reason = "byte_shock";
-            double regime_delta = 0.0;
-            const char* action =
-                close_current_regime("byte_shock", &regime_delta);
-
-            if (train_log.enabled()) {
-                train_log.log_learning(local_seq, action, policy_matrix.size(),
-                                       regime_delta, 0.0, -1,
-                                       last_stable_weights);
-            }
-
-            // Saved at trace end; see the feature-drift close above.
-
-            open_new_regime();
-            if (out_regime_reset) *out_regime_reset = true;
-        }
 
         if (train_log.enabled() && train_log.interval() > 0 &&
             (local_seq % train_log.interval()) == 0) {
@@ -2371,7 +2580,7 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
                                    current_weights);
         }
         return false;
-    } else {
+            } else {
         // TEST selection happens once at regime open through
         // select_regime_arm(); never probe or reselect inside this regime.
         return false;
@@ -2396,26 +2605,51 @@ void WorkloadProfiler::recalculate_features() {
     size_t unique = id_counts.size();
     if (unique == 0) return;
 
-    current_features.write_ratio = static_cast<double>(write_count) / total;
-    current_features.avg_request_size = size_sum / total;
-    
-    double mean_sz = current_features.avg_request_size;
+    // Byte-shock detection needs a size reference even when the size feature
+    // itself is masked off, so this one average is always maintained.
+    const double mean_sz = size_sum / total;
+    shock_ref_size = mean_sz;
+
+    // Only the mask's features are computed. An unmasked feature is never
+    // read by distance, containment or the stored box, so filling it in was
+    // pure cost: 15 fields per evaluation regardless of the experiment.
+    if (feature_active[0]) {
+        current_features.write_ratio = static_cast<double>(write_count) / total;
+    }
+    if (feature_active[1]) current_features.avg_request_size = mean_sz;
+    if (feature_active[2]) {
     double var_sz = (size_sq_sum / total) - (mean_sz * mean_sz);
     current_features.size_variance = (var_sz > 0.0) ? var_sz : 0.0;
-
-    current_features.singleton_ratio = static_cast<double>(singleton_count) / total;
-    current_features.avg_frequency = static_cast<double>(total) / unique;
-
-    double mean_f = current_features.avg_frequency;
+    }
+    if (feature_active[3]) {
+        current_features.singleton_ratio =
+            static_cast<double>(singleton_count) / total;
+    }
+    const double mean_f = static_cast<double>(total) / unique;
+    if (feature_active[5]) current_features.avg_frequency = mean_f;
+    if (feature_active[4]) {
     double var_f = (freq_sq_sum / unique) - (mean_f * mean_f);
-    current_features.popularity_skewness = (var_f > 0.0) ? std::sqrt(var_f) : 0.0;
+        current_features.popularity_skewness =
+            (var_f > 0.0) ? std::sqrt(var_f) : 0.0;
+    }
+    if (feature_active[6]) {
+        current_features.object_diversity =
+            static_cast<double>(unique) / total;
+    }
+    if (feature_active[7]) {
+        current_features.avg_reuse_distance =
+            (reuse_count > 0) ? (total_reuse_dist / reuse_count) : 0.0;
+    }
+    if (feature_active[8]) {
+        current_features.sequentiality_ratio =
+            static_cast<double>(sequential_count) / total;
+    }
+    if (feature_active[9]) {
+        current_features.out_cache_hit_rate =
+            static_cast<double>(out_cache_hits) / total;
+    }
 
-    current_features.object_diversity = static_cast<double>(unique) / total;
-    current_features.avg_reuse_distance = (reuse_count > 0) ? (total_reuse_dist / reuse_count) : 0.0;
-    current_features.sequentiality_ratio = static_cast<double>(sequential_count) / total;
-    current_features.out_cache_hit_rate = static_cast<double>(out_cache_hits) / total;
-
-    if (dt_count > 0) {
+    if (need_time_features && dt_count > 0) {
         double mean_dt = dt_sum / dt_count;
         double var_dt = (dt_sq_sum / dt_count) - (mean_dt * mean_dt);
         if (var_dt < 0.0) var_dt = 0.0;
@@ -2438,12 +2672,17 @@ void WorkloadProfiler::recalculate_features() {
         const double std_dt = std::sqrt(var_dt);
         current_features.burstiness_index =
             (mean_dt > 0.0) ? (std_dt / mean_dt) : 0.0;
-    } else {
+    } else if (need_time_features) {
         current_features.request_rate = 0.0;
         current_features.arrival_time_variance = 0.0;
         current_features.burstiness_index = 0.0;
     }
 
+    if (feature_active[13]) {
     current_features.working_set_byte_delta = working_set_bytes;
-    current_features.scan_ratio = static_cast<double>(first_time_seen_count) / total;
+    }
+    if (feature_active[14]) {
+        current_features.scan_ratio =
+            static_cast<double>(first_time_seen_count) / total;
+    }
 }

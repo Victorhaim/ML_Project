@@ -15,6 +15,21 @@
 using namespace std;
 using namespace TLCache;
 
+namespace {
+// {arc_lo, arc_width} as fractions of the ring measured from q.head, the LRU
+// end. An arc_lo of 0.75 with width 0.5 wraps past q.tail back to q.head,
+// which is how the "ends" arms stay a single contiguous stretch. These are
+// the real per-arm policies and the basis KNN interpolates between in TEST.
+constexpr double MODE_ARC[TLCacheMABCache::MODE_ARM_COUNT][2] = {
+    {0.750, 0.500}, // 0 Balanced ends  - across the ring junction
+    {0.500, 0.500}, // 1 Tail+          - newest half
+    {0.000, 0.500}, // 2 Head+          - oldest half
+    {0.000, 1.000}, // 3 Explore        - whole ring
+    {0.250, 0.500}, // 4 Lean middle    - middle half
+    {0.625, 0.750}, // 5 Lean ends      - wider arc across the junction
+};
+}
+
 TLCacheMABCache::~TLCacheMABCache() {
     const double mab_omr = total_req_count > 0
         ? static_cast<double>(total_miss_count) / total_req_count : 0.0;
@@ -439,21 +454,10 @@ uint8_t TLCacheMABCache::arm_rotate_start() {
 }
 
 void TLCacheMABCache::arm_set_arc_from_arm(uint8_t arm) {
-    // {arc_lo, arc_width} as fractions of the ring from q.head, the LRU end.
-    // An arc_lo of 0.75 with width 0.5 wraps past q.tail back to q.head, which
-    // is how the two "ends" arms stay a single contiguous stretch.
-    static const double arcs[MODE_ARM_COUNT][2] = {
-        {0.750, 0.500}, // 0 Balanced ends  - across the ring junction
-        {0.500, 0.500}, // 1 Tail+          - newest half
-        {0.000, 0.500}, // 2 Head+          - oldest half
-        {0.000, 1.000}, // 3 Explore        - whole ring
-        {0.250, 0.500}, // 4 Lean middle    - middle half
-        {0.625, 0.750}, // 5 Lean ends      - wider arc across the junction
-    };
     int a = static_cast<int>(arm);
     if (a < 0 || a >= static_cast<int>(MODE_ARM_COUNT)) a = 3;
-    arc_lo = arcs[a][0];
-    arc_width = arcs[a][1];
+    arc_lo = MODE_ARC[a][0];
+    arc_width = MODE_ARC[a][1];
     start_arc_lo = arc_lo;
     start_arc_width = arc_width;
     // A new arm means a new region, so restart the cursor and the lap.
@@ -471,6 +475,90 @@ void TLCacheMABCache::arm_set_arc_from_arm(uint8_t arm) {
     }
     mab_normalize_weights();
     mab_compute_probs();
+    if (profiler.get_mode() == ProfilerMode::TEST) {
+        const std::vector<double> arc{arc_lo, arc_width};
+        profiler.set_window_start_audit(static_cast<int>(start_arm), arc);
+    }
+}
+
+void TLCacheMABCache::arm_set_arc_from_weights(
+        const std::vector<double>& arm_weights, uint8_t fallback_arm) {
+    // Each arm votes with the middle of its window, not the window's start.
+    // Concentration is 1 - width, so Explore (width 1) widens the result
+    // without dragging it toward a fake point. The stored arm is only the
+    // initial window; the same lap heuristic still moves it afterward.
+    double vx = 0.0, vy = 0.0, total = 0.0;
+    const size_t arms = std::min<size_t>(MODE_ARM_COUNT, arm_weights.size());
+    for (size_t arm = 0; arm < arms; ++arm) {
+        const double weight = std::isfinite(arm_weights[arm])
+            ? std::max(0.0, arm_weights[arm]) : 0.0;
+        if (weight <= 0.0) continue;
+        const double width = MODE_ARC[arm][1];
+        double center = std::fmod(MODE_ARC[arm][0] + 0.5 * width, 1.0);
+        if (center < 0.0) center += 1.0;
+        const double concentration = std::max(0.0, 1.0 - width);
+        const double angle = 2.0 * M_PI * center;
+        vx += weight * concentration * std::cos(angle);
+        vy += weight * concentration * std::sin(angle);
+        total += weight;
+    }
+
+    if (total <= 0.0) {
+        arm_set_arc_from_arm(fallback_arm);
+        return;
+    }
+    vx /= total;
+    vy /= total;
+
+    const double magnitude = std::sqrt(vx * vx + vy * vy);
+    double width = 1.0 - magnitude;
+    // No shared centre: the neighbours cover the queue between them.
+    if (width >= 1.0 - 1e-6) {
+        arc_lo = 0.0;
+        arc_width = 1.0;
+    } else {
+        width = std::min(ARC_MAX_WIDTH, std::max(ARC_MIN_WIDTH, width));
+        double center = std::atan2(vy, vx) / (2.0 * M_PI);
+        if (center < 0.0) center += 1.0;
+        double start = center - 0.5 * width;
+        if (start < 0.0) start += 1.0;
+        if (start >= 1.0) start -= 1.0;
+        arc_lo = start;
+        arc_width = width;
+    }
+    start_arc_lo = arc_lo;
+    start_arc_width = arc_width;
+
+    // A blended arc is still one region, so the cursor and lap restart the
+    // same way a discrete arm's would.
+    arc_pointer = UINT32_MAX;
+    arc_lap_len = 0;
+    arc_scan_pos = 0;
+    arc_probe_used = 0;
+    zone_samples.fill(0);
+    zone_evictions.fill(0);
+
+    // The blend has no single owning arm. Credit the heaviest neighbour so
+    // eviction accounting and the match logs still name something real.
+    uint8_t dominant = (fallback_arm < MODE_ARM_COUNT) ? fallback_arm : 3;
+    double best = -1.0;
+    for (size_t arm = 0; arm < arms; ++arm) {
+        if (arm_weights[arm] > best) {
+            best = arm_weights[arm];
+            dominant = static_cast<uint8_t>(arm);
+        }
+    }
+    start_arm = dominant;
+    committed_arm = dominant;
+    last_mode_arm = dominant;
+
+    for (int i = 0; i < mab_k; ++i) {
+        mab_weights[i] = (i < static_cast<int>(arm_weights.size()))
+            ? std::max(0.0, arm_weights[static_cast<size_t>(i)]) : 0.0;
+    }
+    mab_normalize_weights();
+    mab_compute_probs();
+
     if (profiler.get_mode() == ProfilerMode::TEST) {
         const std::vector<double> arc{arc_lo, arc_width};
         profiler.set_window_start_audit(static_cast<int>(start_arm), arc);
@@ -689,7 +777,16 @@ void TLCacheMABCache::arm_selector_begin_regime() {
     arm_context_ready = true;
     bool matched = false;
     const uint8_t arm = profiler.select_regime_arm(&matched);
-    arm_set_arc_from_arm(arm);
+    // TEST interpolates the neighbours it matched into one arc. TRAIN keeps
+    // playing discrete arms, because that is what produces the labels.
+    // The copy matters: the setter below rewrites the profiler's own weight
+    // vector with the audit arc.
+    if (profiler.get_mode() == ProfilerMode::TEST && matched) {
+        const std::vector<double> blend = profiler.get_active_policy_weights();
+        arm_set_arc_from_weights(blend, arm);
+    } else {
+        arm_set_arc_from_arm(arm);
+    }
     arm_phase = ArmPhase::Committed;
     policy_frozen = true;
     if (matched) inject_count++;
@@ -1084,9 +1181,22 @@ void TLCacheMABCache::init_with_params(const map<string, string> &params) {
         train_log_enable = false;
     }
 
+    double shift_sigma = 2.0;
+    auto ss_it = get_param("shift_sigma", "shift-sigma");
+    if (ss_it != params.end()) {
+        shift_sigma = atof(ss_it->second.c_str());
+    }
+
+    // Containment pad, in units of the feature's robust sigma.
+    auto bp_it = get_param("box_pad", "box-pad");
+
     profiler.init(mode_str, policy_file_path, config_file_path, this->getSize(), mab_k,
                   train_log_enable, train_log_prefix, train_log_interval,
                   feature_mask, persist_event_logs);
+    profiler.set_shift_sigma(shift_sigma);
+    if (bp_it != params.end()) {
+        profiler.set_box_pad(atof(bp_it->second.c_str()));
+    }
     diag.init(diag_enable, diag_prefix, diag_interval, mab_k);
     if (diag.enabled()) {
         diag.log_event(0, "start", mode_str.c_str(), 0.0, 0.0, mab_weights);
@@ -1326,7 +1436,10 @@ void TLCacheMABCache::mab_sample_mode(uint8_t mode, vector<uint32_t> &sampled_ob
         return;
     }
 
-    const uint8_t mode_id = (uint8_t)(mode % 4);
+    // Six arms, six regions. This used to be mode % 4, which silently made
+    // arm 4 sample like arm 0 and arm 5 like arm 1.
+    const uint8_t mode_id =
+        (mode < MODE_ARM_COUNT) ? mode : static_cast<uint8_t>(3);
 
     // Each mode owns a genuinely different slice of the queue, and we
     // STRIDE across that slice instead of taking a contiguous prefix. With
@@ -1346,6 +1459,15 @@ void TLCacheMABCache::mab_sample_mode(uint8_t mode, vector<uint32_t> &sampled_ob
         break;
     case 2: // Head+: newly admitted half.
         lo1 = 0;                       hi1 = std::max(1u, queue_len / 2);
+        break;
+    case 4: // Lean middle: the middle half, both ends excluded.
+        lo1 = queue_len / 4;
+        hi1 = std::max(lo1 + 1u, lo1 + std::max(1u, queue_len / 2));
+        if (hi1 > queue_len) hi1 = queue_len;
+        break;
+    case 5: // Lean ends: wider than arm 0, still split across both ends.
+        lo1 = 0;                       hi1 = std::max(1u, (queue_len * 3u) / 8u);
+        lo2 = queue_len - std::max(1u, (queue_len * 3u) / 8u); hi2 = queue_len;
         break;
     case 3: // Explore: whole queue, uniform stride.
     default:
