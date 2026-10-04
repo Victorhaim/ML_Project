@@ -50,6 +50,8 @@ WorkloadProfiler::WorkloadProfiler() :
     phase_box_min = WorkloadFeatures();
     phase_box_max = WorkloadFeatures();
     phase_box_init = false;
+    phase_stats_ready = false;
+    phase_samples.clear();
     prev_window_features = WorkloadFeatures();
 }
 
@@ -206,11 +208,14 @@ bool WorkloadProfiler::box_inside_box(const WorkloadFeatures& inner_min,
     auto imx = to_vector(inner_max);
     auto omn = to_vector(outer_min);
     auto omx = to_vector(outer_max);
+    int compared = 0;
     for (size_t i : active_idx) {
         if (!feature_matchable(i)) continue;
+        ++compared;
         if (imn[i] < omn[i] || imx[i] > omx[i]) return false;
     }
-    return true;
+    // No structural feature to compare: do not treat every box as nested.
+    return compared > 0;
 }
 
 bool WorkloadProfiler::point_in_box(const WorkloadFeatures& p,
@@ -230,27 +235,232 @@ bool WorkloadProfiler::point_in_box(const WorkloadFeatures& p,
 
 bool WorkloadProfiler::record_contains(const WorkloadFeatures& p,
                                        const PolicyRecord& rec) const {
-    if (rec.has_box) {
-        return point_in_box(p, rec.feat_min, rec.feat_max);
-    }
-    // Backward-compatible degenerate point row.
-    double dist = 0.0;
-    {
-        // Local copy of distance without mutating last_match_dist.
-        auto v1 = to_vector(p);
-        auto v2 = to_vector(rec.features);
-        double weighted_sum = 0.0;
-        double total_weight = 0.0;
-        for (size_t i : active_idx) {
-            if (!feature_usable(i)) continue;
-            double norm_diff = std::min(MAX_NORM_DIFF,
-                                        std::abs(v1[i] - v2[i]) / feature_std(i));
-            weighted_sum += feature_importance_weights[i] * norm_diff;
-            total_weight += feature_importance_weights[i];
+    if (rec.sample_count == 0 && !rec.has_box) return false;
+    return standardized_distance(p, rec.features, rec.feat_std) <=
+           rec.drift_limit + 1e-12;
+}
+
+double WorkloadProfiler::standardized_distance(const WorkloadFeatures& a,
+                                               const WorkloadFeatures& b,
+                                               const WorkloadFeatures& scale) const {
+    const auto av = to_vector(a);
+    const auto bv = to_vector(b);
+    const auto sv = to_vector(scale);
+    double sum = 0.0;
+    int n = 0;
+    for (size_t i : active_idx) {
+        if (!feature_matchable(i)) continue;
+        const double diff = std::abs(av[i] - bv[i]);
+        const double level = std::max(std::abs(av[i]), std::abs(bv[i]));
+        const double s = sv[i];
+        if (!(s > 0.0) || s <= level * 1e-9) {
+            if (diff <= std::max(1e-12, level * 1e-6)) continue;
+            sum += MAX_NORM_DIFF;
+            ++n;
+            continue;
         }
-        dist = total_weight > 0.0 ? weighted_sum / total_weight : 1e300;
+        sum += std::min(MAX_NORM_DIFF, diff / s);
+        ++n;
     }
-    return dist <= std::max(matrix_epsilon, 1e-6);
+    return n > 0 ? sum / static_cast<double>(n) : 0.0;
+}
+
+void WorkloadProfiler::set_acceptance_box(PolicyRecord& rec) const {
+    const auto mean = to_vector(rec.features);
+    const auto stdev = to_vector(rec.feat_std);
+    std::vector<double> lo(mean.size()), hi(mean.size());
+    const double limit = std::max(rec.drift_limit, 0.0);
+    for (size_t i = 0; i < mean.size(); ++i) {
+        const double reach = limit * std::max(stdev[i], 0.0);
+        lo[i] = mean[i] - reach;
+        hi[i] = mean[i] + reach;
+    }
+    from_vector(lo, rec.feat_min);
+    from_vector(hi, rec.feat_max);
+    rec.has_box = true;
+}
+
+void WorkloadProfiler::pool_stats(WorkloadFeatures& mean, WorkloadFeatures& stdev,
+                                  uint32_t& count,
+                                  const WorkloadFeatures& mean2,
+                                  const WorkloadFeatures& std2,
+                                  uint32_t count2) const {
+    if (count2 == 0) return;
+    if (count == 0) {
+        mean = mean2;
+        stdev = std2;
+        count = count2;
+        return;
+    }
+    auto m1 = to_vector(mean);
+    auto s1 = to_vector(stdev);
+    const auto m2 = to_vector(mean2);
+    const auto s2 = to_vector(std2);
+    const double n1 = static_cast<double>(count);
+    const double n2 = static_cast<double>(count2);
+    const double n = n1 + n2;
+    for (size_t i = 0; i < m1.size(); ++i) {
+        const double mean_pool = (n1 * m1[i] + n2 * m2[i]) / n;
+        const double m2_1 = s1[i] * s1[i] * n1;
+        const double m2_2 = s2[i] * s2[i] * n2;
+        const double delta = m1[i] - m2[i];
+        const double m2_pool = m2_1 + m2_2 + (n1 * n2 / n) * delta * delta;
+        m1[i] = mean_pool;
+        s1[i] = std::sqrt(std::max(0.0, m2_pool / n));
+    }
+    from_vector(m1, mean);
+    from_vector(s1, stdev);
+    count += count2;
+}
+
+void WorkloadProfiler::note_regime_sample() {
+    if (!phase_box_init || phase_stats_ready) return;
+    recalculate_features();
+    const auto v = to_vector(current_features);
+    phase_samples.insert(phase_samples.end(), v.begin(), v.end());
+    if (phase_requests >= MIN_REGIME_LEN) finalize_regime_stats();
+}
+
+void WorkloadProfiler::finalize_regime_stats() {
+    if (phase_stats_ready) return;
+    const size_t width = 15;
+    const size_t n = phase_samples.size() / width;
+    if (n == 0) {
+        phase_mean = current_features;
+        phase_std = WorkloadFeatures();
+        phase_drift_limit = 1.0;
+        phase_sample_count = 0;
+        phase_stats_ready = true;
+        phase_box_frozen = true;
+        if (current_mode == ProfilerMode::TRAIN && !phase_arm_chosen) {
+            assign_train_arm_from_mean();
+        }
+        return;
+    }
+    std::vector<double> sum(width, 0.0), sumsq(width, 0.0);
+    for (size_t s = 0; s < n; ++s) {
+        for (size_t i = 0; i < width; ++i) {
+            const double x = phase_samples[s * width + i];
+            sum[i] += x;
+            sumsq[i] += x * x;
+        }
+    }
+    std::vector<double> mean(width), stdev(width);
+    for (size_t i = 0; i < width; ++i) {
+        mean[i] = sum[i] / static_cast<double>(n);
+        const double var = sumsq[i] / static_cast<double>(n) - mean[i] * mean[i];
+        stdev[i] = std::sqrt(std::max(0.0, var));
+    }
+    from_vector(mean, phase_mean);
+    from_vector(stdev, phase_std);
+
+    std::vector<double> dists;
+    dists.reserve(n);
+    for (size_t s = 0; s < n; ++s) {
+        std::vector<double> sample(phase_samples.begin() + static_cast<std::ptrdiff_t>(s * width),
+                                   phase_samples.begin() + static_cast<std::ptrdiff_t>((s + 1) * width));
+        WorkloadFeatures point;
+        from_vector(sample, point);
+        dists.push_back(standardized_distance(point, phase_mean, phase_std));
+    }
+    std::sort(dists.begin(), dists.end());
+    const double pos = 0.95 * static_cast<double>(dists.size() - 1);
+    const size_t i = static_cast<size_t>(pos);
+    const double frac = pos - static_cast<double>(i);
+    const double hi = dists[std::min(i + 1, dists.size() - 1)];
+    const double p95 = dists[i] * (1.0 - frac) + hi * frac;
+    // A perfectly flat window has p95 0. One standard deviation is then
+    // still the same behaviour; a real move is many standard deviations.
+    phase_drift_limit = (p95 > 1e-9) ? p95 : 1.0;
+    phase_sample_count = static_cast<uint32_t>(n);
+    phase_stats_ready = true;
+    phase_box_frozen = true;
+    phase_samples.clear();
+    if (current_mode == ProfilerMode::TRAIN && !phase_arm_chosen) {
+        assign_train_arm_from_mean();
+    }
+}
+
+void WorkloadProfiler::park_queue_after(PolicyRecord& rec, int arm) const {
+    rec.tried_arms_mask |= static_cast<uint16_t>(1u << arm);
+    const int n = static_cast<int>(rec.arm_queue.size());
+    if (n <= 0) return;
+    int idx = 0;
+    for (int i = 0; i < n; ++i) {
+        if (rec.arm_queue[static_cast<size_t>(i)] == static_cast<uint8_t>(arm)) {
+            idx = i;
+            break;
+        }
+    }
+    for (int k = 1; k <= n; ++k) {
+        const int i = (idx + k) % n;
+        const unsigned queued = rec.arm_queue[static_cast<size_t>(i)];
+        if (queued < 16 &&
+            (rec.tried_arms_mask & static_cast<uint16_t>(1u << queued)) == 0) {
+            rec.queue_next = static_cast<uint8_t>(i);
+            return;
+        }
+    }
+    rec.queue_next = static_cast<uint8_t>((idx + 1) % n);
+}
+
+void WorkloadProfiler::assign_train_arm_from_mean() {
+    int row_idx = -1;
+    double best_dist = 1e300;
+    for (size_t i = 0; i < policy_matrix.size(); ++i) {
+        const PolicyRecord& rec = policy_matrix[i];
+        if (rec.winner_arm < 0 || rec.sample_count == 0) continue;
+        const double dist = standardized_distance(
+            phase_mean, rec.features, rec.feat_std);
+        if (dist <= rec.drift_limit && dist < best_dist) {
+            best_dist = dist;
+            row_idx = static_cast<int>(i);
+        }
+    }
+
+    uint8_t arm = 3;
+    if (row_idx < 0) {
+        arm = static_cast<uint8_t>(
+            train_arm_rotation % std::max<uint8_t>(1, current_mab_k));
+        train_arm_rotation = static_cast<uint8_t>(
+            (train_arm_rotation + 1) % std::max<uint8_t>(1, current_mab_k));
+        active_train_policy_row = -1;
+    } else {
+        PolicyRecord& rec = policy_matrix[static_cast<size_t>(row_idx)];
+        if (rec.arm_queue.size() != static_cast<size_t>(current_mab_k)) {
+            initialize_arm_queue(rec);
+        }
+        const int n = static_cast<int>(rec.arm_queue.size());
+        int start = rec.queue_next;
+        if (start < 0 || start >= n) start = 0;
+        arm = (n > 0) ? rec.arm_queue[static_cast<size_t>(start)] : 3;
+        for (int k = 0; k < n; ++k) {
+            const int i = (start + k) % n;
+            const unsigned queued = rec.arm_queue[static_cast<size_t>(i)];
+            if (queued < 16 &&
+                (rec.tried_arms_mask & static_cast<uint16_t>(1u << queued)) == 0) {
+                arm = static_cast<uint8_t>(queued);
+                break;
+            }
+        }
+        active_train_policy_row = row_idx;
+    }
+    active_train_arm = static_cast<int>(arm);
+    phase_arm_chosen = true;
+    phase_score_active = false;
+    score_requests = 0;
+    score_bytes = 0;
+    score_miss_bytes = 0;
+    score_shadow_miss_bytes = 0;
+    deferred_arm = arm;
+    deferred_arm_ready = true;
+}
+
+bool WorkloadProfiler::take_deferred_train_arm(uint8_t* out_arm) {
+    if (!deferred_arm_ready) return false;
+    deferred_arm_ready = false;
+    if (out_arm) *out_arm = deferred_arm;
+    return true;
 }
 
 void WorkloadProfiler::open_new_regime() {
@@ -259,6 +469,15 @@ void WorkloadProfiler::open_new_regime() {
     phase_box_max = current_features;
     phase_box_init = true;
     phase_box_frozen = false;
+    phase_samples.clear();
+    phase_mean = current_features;
+    phase_std = WorkloadFeatures();
+    phase_drift_limit = 1.0;
+    phase_sample_count = 0;
+    phase_stats_ready = false;
+    phase_arm_chosen = false;
+    deferred_arm_ready = false;
+    deferred_arm = 3;
     phase_profile_ready = profile_ready_seen;
     drift_ticks = 0;
     phase_ticks = 0;
@@ -316,10 +535,10 @@ void WorkloadProfiler::initialize_arm_queue(PolicyRecord& record) {
     record.queue_next = 0;
 }
 
-const char* WorkloadProfiler::upsert_policy(const WorkloadFeatures& center,
-                                            const WorkloadFeatures& box_min,
-                                            const WorkloadFeatures& box_max,
-                                            bool has_box,
+const char* WorkloadProfiler::upsert_policy(const WorkloadFeatures& mean,
+                                            const WorkloadFeatures& stdev,
+                                            uint32_t sample_count,
+                                            double drift_limit,
                                             int arm,
                                             double miss_rate,
                                             double delta,
@@ -329,58 +548,37 @@ const char* WorkloadProfiler::upsert_policy(const WorkloadFeatures& center,
         return "upsert_reject";
     }
 
+    // The finished regime is its mean and its own standard deviation.
+    // A row's geography is frozen at creation. A revisit records the arm
+    // and the visit count, and does not move or widen the row.
+    //   1. its mean sits inside an existing row -> update that row's arms;
+    //   2. existing rows sit inside this regime -> replace them with this
+    //      regime's own geography, keeping their arm evidence;
+    //   3. neither -> the area is new.
+    int parent = -1;
+    double parent_dist = 1e300;
+    std::vector<int> absorbed;
     double min_dist = 1e300;
-    auto consider_near = [&](int i) {
-        if (i < 0 || i >= static_cast<int>(policy_matrix.size())) return;
-        if (policy_matrix[static_cast<size_t>(i)].winner_arm < 0) return;
-        const double dist = calculate_aggregate_distance(
-            center, policy_matrix[static_cast<size_t>(i)].features);
-        if (dist < min_dist) min_dist = dist;
-    };
-    if (index_linear_faster(IndexUse::Lookup)) {
-        for (size_t i = 0; i < policy_matrix.size(); ++i) consider_near(static_cast<int>(i));
-    } else {
-        for (int i : index_candidates_point(center)) consider_near(i);
+    for (size_t i = 0; i < policy_matrix.size(); ++i) {
+        const PolicyRecord& rec = policy_matrix[i];
+        if (rec.winner_arm < 0) continue;
+        const double toward_row =
+            standardized_distance(mean, rec.features, rec.feat_std);
+        if (toward_row < min_dist) min_dist = toward_row;
+        if (toward_row <= rec.drift_limit) {
+            if (toward_row < parent_dist) {
+                parent = static_cast<int>(i);
+                parent_dist = toward_row;
+            }
+        } else if (standardized_distance(mean, rec.features, stdev) <=
+                   drift_limit) {
+            absorbed.push_back(static_cast<int>(i));
+        }
     }
     if (out_dist) *out_dist = (policy_matrix.empty() ? 1e300 : min_dist);
 
-    // Coverage is the row that handed out the arm at open. Re-checking
-    // containment at close would treat a drifted window as a new area and
-    // store the whole min/max span as a wide box that then swallows later
-    // regimes. A new row is created only when open found no containing row.
-    int row_idx = active_train_policy_row;
-    if (row_idx < 0 || row_idx >= static_cast<int>(policy_matrix.size()) ||
-        policy_matrix[static_cast<size_t>(row_idx)].winner_arm < 0) {
-        double best = 1e300;
-        row_idx = -1;
-        auto consider_contain = [&](int i) {
-            if (i < 0 || i >= static_cast<int>(policy_matrix.size())) return;
-            if (!record_contains(center, policy_matrix[static_cast<size_t>(i)])) return;
-            const double dist = calculate_aggregate_distance(
-                center, policy_matrix[static_cast<size_t>(i)].features);
-            if (dist < best) {
-                best = dist;
-                row_idx = i;
-            }
-        };
-        if (index_linear_faster(IndexUse::Lookup)) {
-            for (size_t i = 0; i < policy_matrix.size(); ++i) consider_contain(static_cast<int>(i));
-        } else {
-            for (int i : index_candidates_point(center)) consider_contain(i);
-        }
-    }
-
-    // Row existence is geographic, never a reward gate. If this regime
-    // opened from an existing row, always record that the arm was tried.
-    // Replace the row's policy only when this arm's measured score is
-    // better; a loss is still useful arm evidence.
-    //
-    // The box is deliberately not stretched on a revisit: growing one row
-    // lets it swallow the feature space and prevents genuinely new areas from
-    // receiving their own rows.
-    if (row_idx >= 0) {
-        PolicyRecord& src = policy_matrix[static_cast<size_t>(row_idx)];
-        src.tried_arms_mask |= static_cast<uint16_t>(1u << arm);
+    auto note_result = [&](PolicyRecord& src) -> const char* {
+        park_queue_after(src, arm);
         if (src.winner_arm < 0 || delta > src.best_delta) {
             src.winner_arm = arm;
             src.best_miss_rate = miss_rate;
@@ -388,36 +586,98 @@ const char* WorkloadProfiler::upsert_policy(const WorkloadFeatures& center,
             return "upsert_update_better";
         }
         return "upsert_update_keep";
+    };
+
+    auto make_row = [&](const WorkloadFeatures& row_mean,
+                        const WorkloadFeatures& row_std,
+                        uint32_t row_count,
+                        double row_limit,
+                        int winner, double winner_miss, double winner_delta,
+                        uint16_t tried,
+                        const std::vector<uint8_t>& queue,
+                        uint8_t queue_next) {
+        PolicyRecord rec;
+        rec.features = row_mean;
+        rec.feat_std = row_std;
+        rec.sample_count = row_count;
+        rec.drift_limit = row_limit;
+        set_acceptance_box(rec);
+        if (queue.empty()) initialize_arm_queue(rec);
+        else {
+            rec.arm_queue = queue;
+            rec.queue_next = queue_next;
+        }
+        rec.tried_arms_mask = tried;
+        const int n = static_cast<int>(rec.arm_queue.size());
+        if (n > 0) {
+            if (rec.queue_next >= static_cast<uint8_t>(n)) rec.queue_next = 0;
+            for (int k = 0; k < n; ++k) {
+                const int i = (static_cast<int>(rec.queue_next) + k) % n;
+                const unsigned queued = rec.arm_queue[static_cast<size_t>(i)];
+                if (queued < 16 &&
+                    (rec.tried_arms_mask &
+                     static_cast<uint16_t>(1u << queued)) == 0) {
+                    rec.queue_next = static_cast<uint8_t>(i);
+                    break;
+                }
+            }
+        }
+        rec.winner_arm = winner;
+        rec.best_miss_rate = winner_miss;
+        rec.best_delta = winner_delta;
+        policy_matrix.push_back(std::move(rec));
+        active_train_policy_row = static_cast<int>(policy_matrix.size() - 1);
+        index_insert_row(active_train_policy_row);
+    };
+
+    if (parent >= 0) {
+        PolicyRecord& src = policy_matrix[static_cast<size_t>(parent)];
+        // Geography stays as first stored. Only the visit count grows.
+        if (sample_count > 0) {
+            const uint64_t sum = static_cast<uint64_t>(src.sample_count) + sample_count;
+            src.sample_count = (sum > 0xffffffffu)
+                ? 0xffffffffu : static_cast<uint32_t>(sum);
+        }
+        active_train_policy_row = parent;
+        return note_result(src);
     }
 
-    // No row contains this area: create it regardless of win or loss. Its
-    // delta is data attached to the area, not permission for the area to
-    // exist.
-    PolicyRecord rec;
-    rec.features = center;
-    rec.feat_min = box_min;
-    rec.feat_max = box_max;
-    rec.has_box = has_box;
-    initialize_arm_queue(rec);
-    rec.tried_arms_mask = static_cast<uint16_t>(1u << arm);
-    // This arm was already consumed by the just-finished occurrence.
-    const int n = static_cast<int>(rec.arm_queue.size());
-    for (int i = 0; i < n; ++i) {
-        if (rec.arm_queue[static_cast<size_t>(i)] ==
-            static_cast<uint8_t>(arm)) {
-            rec.queue_next = static_cast<uint8_t>((i + 1) % n);
-            break;
+    if (!absorbed.empty()) {
+        int winner = arm;
+        double winner_miss = miss_rate;
+        double winner_delta = delta;
+        uint16_t tried = static_cast<uint16_t>(1u << arm);
+        std::vector<uint8_t> queue;
+        uint8_t queue_next = 0;
+        double queue_delta = -1e300;
+        for (int idx : absorbed) {
+            const PolicyRecord& src = policy_matrix[static_cast<size_t>(idx)];
+            tried = static_cast<uint16_t>(tried | src.tried_arms_mask);
+            if (src.best_delta > winner_delta) {
+                winner = src.winner_arm;
+                winner_miss = src.best_miss_rate;
+                winner_delta = src.best_delta;
+            }
+            if (!src.arm_queue.empty() && src.best_delta >= queue_delta) {
+                queue = src.arm_queue;
+                queue_next = src.queue_next;
+                queue_delta = src.best_delta;
+            }
         }
+        for (int idx : absorbed) {
+            policy_matrix[static_cast<size_t>(idx)].winner_arm = -1;
+            policy_tombstones++;
+        }
+        compact_policy_matrix();
+        make_row(mean, stdev, sample_count, drift_limit,
+                 winner, winner_miss, winner_delta, tried, queue, queue_next);
+        return "upsert_merge";
     }
-    rec.winner_arm = arm;
-    rec.best_miss_rate = miss_rate;
-    rec.best_delta = delta;
-    policy_matrix.push_back(rec);
-    active_train_policy_row = static_cast<int>(policy_matrix.size() - 1);
-    index_insert_row(active_train_policy_row);
+
+    make_row(mean, stdev, sample_count, drift_limit,
+             arm, miss_rate, delta, static_cast<uint16_t>(1u << arm), {}, 0);
     return "upsert_new";
 }
-
 const char* WorkloadProfiler::close_current_regime(const char* reason,
                                                    double* out_delta) {
     if (out_delta) *out_delta = 0.0;
@@ -464,9 +724,10 @@ const char* WorkloadProfiler::close_current_regime(const char* reason,
     } else if (active_train_arm < 0) {
         action = "skip_uncommitted";
     } else {
+        if (!phase_stats_ready) finalize_regime_stats();
         double dist = 0.0;
-        action = upsert_policy(last_stable_features,
-                               phase_box_min, phase_box_max, true,
+        action = upsert_policy(phase_mean, phase_std, phase_sample_count,
+                               phase_drift_limit,
                                active_train_arm, mab_bmr, delta, &dist);
     }
 
@@ -668,24 +929,6 @@ void WorkloadProfiler::flush_test_match_events(bool rebuild_stats) {
                     write_features_csv(file, ev.inject_features);
                     file << ",";
                     write_features_csv(file, ev.close_features);
-                    file << "\n";
-                }
-            }
-        }
-    }
-    if (!test_match_events.empty() && !nn_distances_path.empty()) {
-        if (ensure_parent_dir(nn_distances_path)) {
-            const bool exists = std::filesystem::exists(nn_distances_path);
-            std::ofstream file(nn_distances_path, std::ios::app);
-            if (file.is_open()) {
-                if (!exists) {
-                    file << "avg_size,bytes,delta_bmr,nn1,nn2,nn3,nn4,nn5\n";
-                }
-                for (const auto& ev : test_match_events) {
-                    file << ev.avg_size << ","
-                         << ev.bytes << ","
-                         << ev.delta_bmr;
-                    for (double d : ev.nn_dist) file << "," << d;
                     file << "\n";
                 }
             }
@@ -1430,6 +1673,8 @@ void WorkloadProfiler::init(const std::string& mode_str,
     train_total_reqs = 0;
     train_total_misses = 0;
     phase_box_init = false;
+    phase_stats_ready = false;
+    phase_samples.clear();
     last_match_attempt_seq = 0;
     active_policy_match = false;
     feature_scale_loaded = false;
@@ -1456,7 +1701,7 @@ void WorkloadProfiler::init(const std::string& mode_str,
             persist_event_logs ? (test_dir / "match_events.csv").string()
                                : std::string(),
             (test_dir / "match_stats.csv").string(),
-            (test_dir / "nn_distances.csv").string());
+            std::string());
         set_test_type_stats_path((test_dir / "type_stats.csv").string());
     } else { 
         current_mode = ProfilerMode::TRAIN;
@@ -1926,18 +2171,19 @@ void WorkloadProfiler::save_policy_matrix() {
     std::ofstream file(tmp, std::ios::trunc);
     if (!file.is_open()) return;
 
-    // v8 stores the box over the mask's features only. Row creation is
-    // geography-only; reward updates the policy attached to an existing row.
-    // The other coordinates are never read by distance or containment.
-    file << "knn_v8,mask=" << feature_mask_str
-         << ",box_min_active,box_max_active,winner_arm,best_miss_rate,"
+    // v9 stores the mean and std of the requests that defined the row.
+    // A later regime joins the row when its mean is inside that variation.
+    file << "knn_v9,mask=" << feature_mask_str
+         << ",mean_active,std_active,sample_count,drift_limit,winner_arm,best_miss_rate,"
             "best_delta,queue,queue_next,tried_arms_mask\n";
     for (const auto& record : policy_matrix) {
-        file << "knn_v8,box,";
-        write_active_csv(file, record.feat_min);
+        file << "knn_v9,stat,";
+        write_active_csv(file, record.features);
         file << ",";
-        write_active_csv(file, record.feat_max);
-        file << "," << record.winner_arm
+        write_active_csv(file, record.feat_std);
+        file << "," << record.sample_count
+             << "," << record.drift_limit
+             << "," << record.winner_arm
              << "," << record.best_miss_rate
              << "," << record.best_delta;
         std::vector<uint8_t> queue = record.arm_queue;
@@ -1974,8 +2220,8 @@ void WorkloadProfiler::load_policy_matrix() {
     std::ifstream file(policy_filename);
     if (!file.is_open()) return;
 
-    const std::string row_tag = "knn_v8,box,";
-    const std::string want_hdr = "knn_v8,mask=" + feature_mask_str + ",";
+    const std::string row_tag = "knn_v9,stat,";
+    const std::string want_hdr = "knn_v9,mask=" + feature_mask_str + ",";
     const size_t nf = active_idx.size();
 
     std::string line;
@@ -1983,7 +2229,7 @@ void WorkloadProfiler::load_policy_matrix() {
     bool mask_mismatch = false;
     while (std::getline(file, line)) {
         if (line.empty()) continue;
-        if (line.rfind("knn_v8,mask=", 0) == 0) {
+        if (line.rfind("knn_v9,mask=", 0) == 0) {
             // A table built under a different mask has a different column
             // meaning per row; loading it would silently compare unrelated
             // coordinates. Drop it and start fresh.
@@ -2014,20 +2260,21 @@ void WorkloadProfiler::load_policy_matrix() {
         if (bad) continue;
 
         const int k = std::max(1, static_cast<int>(current_mab_k));
-        // nf min + nf max + winner + miss + delta + queue[k] + next + mask.
-        const size_t base = 2 * nf;
+        // nf mean + nf std + count + limit + winner + miss + delta + queue[k] + next + mask.
+        const size_t base = 2 * nf + 2;
         if (all_nums.size() != base + 5 + static_cast<size_t>(k)) continue;
-        std::vector<double> lo(15, 0.0), hi(15, 0.0), mid(15, 0.0);
+        std::vector<double> mean(15, 0.0), stdev(15, 0.0);
         for (size_t j = 0; j < nf; ++j) {
             const size_t i = active_idx[j];
-            lo[i] = all_nums[j];
-            hi[i] = all_nums[nf + j];
-            mid[i] = 0.5 * (lo[i] + hi[i]);
+            mean[i] = all_nums[j];
+            stdev[i] = all_nums[nf + j];
         }
-        from_vector(lo, record.feat_min);
-        from_vector(hi, record.feat_max);
-        from_vector(mid, record.features);
-        record.has_box = true;
+        from_vector(mean, record.features);
+        from_vector(stdev, record.feat_std);
+        record.sample_count = static_cast<uint32_t>(all_nums[2 * nf]);
+        record.drift_limit = all_nums[2 * nf + 1];
+        if (!(record.drift_limit > 0.0)) record.drift_limit = 1.0;
+        set_acceptance_box(record);
         record.winner_arm = static_cast<int>(all_nums[base]);
         record.best_miss_rate = all_nums[base + 1];
         record.best_delta = all_nums[base + 2];
@@ -2070,7 +2317,7 @@ void WorkloadProfiler::load_policy_matrix() {
     } else if (rejected_old_rows > 0) {
         std::cerr << "KNN policy schema mismatch: ignored "
                   << rejected_old_rows
-                  << " old row(s); start fresh with knn_v8" << std::endl;
+                  << " old row(s); start fresh with knn_v9" << std::endl;
     }
     compact_policy_matrix();
     rebuild_policy_index();
@@ -2161,62 +2408,21 @@ uint8_t WorkloadProfiler::select_regime_arm(bool* out_matched) {
     if (out_matched) *out_matched = false;
 
     if (current_mode == ProfilerMode::TRAIN) {
-        if (!is_profile_ready()) {
+        if (!is_profile_ready() || !phase_stats_ready) {
+            // The mean does not exist yet. Hold an unscored arm until the
+            // defining window finishes and assign_train_arm_from_mean runs.
             active_train_policy_row = -1;
-            active_train_arm = 3;
+            active_train_arm = -1;
+            phase_arm_chosen = false;
             return 3;
         }
-
-        int row_idx = -1;
-        double best_dist = 1e300;
-        auto consider = [&](int i) {
-            if (i < 0 || i >= static_cast<int>(policy_matrix.size())) return;
-            if (!record_contains(current_features, policy_matrix[static_cast<size_t>(i)])) return;
-            const double dist = calculate_aggregate_distance(
-                current_features, policy_matrix[static_cast<size_t>(i)].features);
-            if (dist < best_dist) {
-                best_dist = dist;
-                row_idx = i;
-            }
-        };
-        if (index_linear_faster(IndexUse::Lookup)) {
-            for (size_t i = 0; i < policy_matrix.size(); ++i) consider(static_cast<int>(i));
-        } else {
-            for (int i : index_candidates_point(current_features)) consider(i);
-        }
-        // No row covers this regime yet. Do not seed one here: a point box
-        // almost never contains the next regime, so seeding at open would add
-        // a row per regime. The close will store the box it actually measured.
-        if (row_idx < 0) {
-            const uint8_t arm = static_cast<uint8_t>(
-                train_arm_rotation % std::max<uint8_t>(1, current_mab_k));
-            train_arm_rotation = static_cast<uint8_t>(
-                (train_arm_rotation + 1) % std::max<uint8_t>(1, current_mab_k));
-            active_train_policy_row = -1;
-            active_train_arm = static_cast<int>(arm);
-            return arm;
-        }
-
-        PolicyRecord& rec = policy_matrix[static_cast<size_t>(row_idx)];
-        if (rec.arm_queue.size() != static_cast<size_t>(current_mab_k)) {
-            initialize_arm_queue(rec);
-        }
-        const int n = static_cast<int>(rec.arm_queue.size());
-        if (n <= 0) {
-            active_train_policy_row = -1;
-            active_train_arm = 3;
-            return 3;
-        }
-        if (rec.queue_next >= static_cast<uint8_t>(n)) rec.queue_next = 0;
-        const uint8_t arm = rec.arm_queue[rec.queue_next];
-        rec.queue_next = static_cast<uint8_t>(
-            (static_cast<int>(rec.queue_next) + 1) % n);
-        active_train_policy_row = row_idx;
-        active_train_arm = arm;
+        if (!phase_arm_chosen) assign_train_arm_from_mean();
+        const uint8_t arm = static_cast<uint8_t>(
+            std::max(0, active_train_arm));
         // The table is saved when the trace ends. run_msr_feature_screen.sh
         // resumes at trace granularity, so saving on every regime open would
         // rewrite the whole table thousands of times and buy nothing.
-        if (out_matched) *out_matched = rec.winner_arm >= 0;
+        if (out_matched) *out_matched = active_train_policy_row >= 0;
         return arm;
     }
 
@@ -2377,8 +2583,9 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
                                  SHOCK_SIZE_MULT * shock_ref_size);
     if (byte_shock) phase_shock_count++;
 
-    // The decision clock. Everything above this point is O(1) per request;
-    // everything below runs once per REGIME_TICK requests.
+    // The decision clock. Counters above are O(1) per request. Regime close
+    // stays on the tick. Min/max collection during the opening 2048 requests
+    // is the exception and runs on the non-tick path above.
     const bool tick = (local_seq % REGIME_TICK) == 0;
     if (!tick) {
         request_counter++;
@@ -2394,7 +2601,7 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
         // when the regime ended, and the delta must cover every committed
         // request rather than only those that landed on a tick.
         if (current_mode == ProfilerMode::TRAIN && arm_committed &&
-            !phase_score_active) {
+            phase_arm_chosen && !phase_score_active) {
             phase_score_active = true;
             score_requests = 0;
             score_bytes = 0;
@@ -2407,16 +2614,18 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
             if (is_miss) score_miss_bytes += size;
             if (shadow_is_miss) score_shadow_miss_bytes += size;
         }
+        if (current_mode == ProfilerMode::TRAIN) {
+            train_total_reqs++;
+            if (is_miss) train_total_misses++;
+        }
+        // The opening window keeps one feature sample per request. After
+        // MIN_REGIME_LEN those samples become the regime mean and std.
+        note_regime_sample();
         if (arm_committed) {
             last_stable_features = current_features;
             last_stable_weights = current_weights;
             normalize_weights(last_stable_weights);
         }
-        if (current_mode == ProfilerMode::TRAIN) {
-            train_total_reqs++;
-            if (is_miss) train_total_misses++;
-        }
-        if (phase_requests >= MIN_REGIME_LEN) phase_box_frozen = true;
         return false;
     }
 
@@ -2471,15 +2680,15 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
     phase_ticks++;
     double current_shift = calculate_aggregate_distance(current_features, phase_start_features);
 
-    // The area is the min/max collected over the first MIN_REGIME_LEN
-    // requests. After that, a tick outside that range is a new regime.
-    // Two such ticks are required so one noisy sample does not cut it.
+    // The regime's own samples set the limit. A tick is a new regime when
+    // the average feature has moved farther than 95% of those samples.
     const bool shock_tick =
         (phase_shock_count >
          static_cast<uint64_t>(SHOCK_TICK_SHARE * REGIME_TICK));
-    const bool outside_box = phase_box_frozen &&
-        !point_in_box(current_features, phase_box_min, phase_box_max);
-    if (outside_box || shock_tick) {
+    const bool unusual = phase_stats_ready &&
+        standardized_distance(current_features, phase_mean, phase_std) >
+            phase_drift_limit;
+    if (unusual || shock_tick) {
         drift_ticks++;
     } else {
         drift_ticks = 0;
@@ -2505,14 +2714,8 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
         open_new_regime();
         if (out_regime_reset) *out_regime_reset = true;
     }
-    // The first minimum-length window defines the area. Requests after that
-    // stay on the same regime until a feature leaves that saved range.
-    if (!phase_box_frozen) {
-        expand_box(phase_box_min, phase_box_max, current_features);
-    }
-
     phase_requests++;
-    if (phase_requests >= MIN_REGIME_LEN) phase_box_frozen = true;
+    note_regime_sample();
     phase_bytes += size;
     if (is_miss) {
         phase_misses++;
@@ -2525,7 +2728,7 @@ bool WorkloadProfiler::add_request(uint64_t id, uint32_t size, bool is_write, do
     // First committed request in this regime: start the store-score window
     // and drop any prior investigate traffic from the upsert delta.
     if (current_mode == ProfilerMode::TRAIN && arm_committed &&
-        !feature_regime_reset && !phase_score_active) {
+        phase_arm_chosen && !feature_regime_reset && !phase_score_active) {
         phase_score_active = true;
         score_requests = 0;
         score_bytes = 0;

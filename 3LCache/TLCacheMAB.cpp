@@ -1290,6 +1290,14 @@ bool TLCacheMABCache::lookup(const SimpleRequest &req) {
         arm_selector_begin_regime();
     }
 
+    uint8_t deferred_arm = 0;
+    if (profiler.take_deferred_train_arm(&deferred_arm)) {
+        arm_set_arc_from_arm(deferred_arm);
+        committed_arm = deferred_arm;
+        arm_phase = ArmPhase::Committed;
+        policy_frozen = true;
+    }
+
     if (should_update_weights && !new_weights.empty()) {
         std::ostringstream detail;
         detail << "inject";

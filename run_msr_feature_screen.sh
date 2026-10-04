@@ -291,7 +291,8 @@ scrub_set_logs() {
     rm -f "$set_dir"/logs/train/*.log "$set_dir"/logs/test/*.log
     rm -f "$set_dir"/logs/train/train/regime_events.csv \
           "$set_dir"/logs/train/train/feature_samples.csv \
-          "$set_dir"/logs/test/test/match_events.csv
+          "$set_dir"/logs/test/test/match_events.csv \
+          "$set_dir"/logs/test/test/nn_distances.csv
 }
 
 summary_field() {
@@ -377,7 +378,7 @@ while IFS='|' read -r SET_ID SET_KIND MASK ACTIVE_COUNT DESCRIPTION; do
     if [ -s "$POLICY" ]; then
         IFS= read -r POLICY_HEADER < "$POLICY" || POLICY_HEADER=""
         case "$POLICY_HEADER" in
-            "knn_v8,mask=${MASK},"*) ;;
+            "knn_v9,mask=${MASK},"*) ;;
             *)
                 echo "  [schema reset] old/incompatible policy; restarting set $SET_ID"
                 rm -f "$POLICY" "$CONFIG" "$PROGRESS"

@@ -55,6 +55,11 @@ struct PolicyRecord {
     WorkloadFeatures features;
     WorkloadFeatures feat_min;
     WorkloadFeatures feat_max;
+    // Per-feature spread of the requests that defined this row, and how far
+    // (in those units) a later regime can sit and still be the same row.
+    WorkloadFeatures feat_std;
+    uint32_t sample_count = 0;
+    double drift_limit = 1.0;
     bool has_box = false;
     int winner_arm = -1;
     double best_miss_rate = 1.0;
@@ -79,15 +84,13 @@ private:
     static constexpr double   SHOCK_SIZE_MULT = 8.0;   // req size vs window avg
 
     // ---- Regime decision clock -------------------------------------------
-    // Features are rolling-window averages over ~16k requests, so they cannot
-    // meaningfully change between two consecutive requests. Evaluating them
-    // per request cost a full feature pass plus a distance computation on
-    // every single request and let one noisy sample cut a regime, which is
-    // how the median regime length collapsed to one request. Decisions now
-    // run on their own clock; the counters behind them stay per-request.
+    // Closing a regime stays on the tick. The first MIN_REGIME_LEN requests
+    // record every feature sample and turn that into a mean and a standard
+    // deviation. A later tick is a new regime only when its average
+    // standardized movement exceeds the variation seen inside that window.
     static constexpr uint64_t REGIME_TICK = 512;      // requests per evaluation
     static constexpr uint32_t DRIFT_CONFIRM = 2;      // ticks above threshold
-    static constexpr uint64_t MIN_REGIME_LEN = 2048;  // no close below this
+    static constexpr uint64_t MIN_REGIME_LEN = 2048;  // requests that define the box
     static constexpr uint64_t MAX_REGIME_LEN = 131072; // forced close
     // A tick counts as drift evidence when this share of it was byte shocks.
     static constexpr double   SHOCK_TICK_SHARE = 0.10;
@@ -169,9 +172,19 @@ private:
     WorkloadFeatures phase_box_min;
     WorkloadFeatures phase_box_max;
     bool phase_box_init = false;
-    // Min/max stop growing once the regime has its minimum length. Later
-    // requests still score the arm; they do not widen the area.
+    // After MIN_REGIME_LEN samples the mean and std are frozen. Later
+    // requests still score the arm; they do not move the regime's center.
     bool phase_box_frozen = false;
+    std::vector<double> phase_samples;
+    WorkloadFeatures phase_mean;
+    WorkloadFeatures phase_std;
+    double phase_drift_limit = 1.0;
+    uint32_t phase_sample_count = 0;
+    bool phase_stats_ready = false;
+    // The training arm is chosen only once the 2048-request mean exists.
+    bool phase_arm_chosen = false;
+    bool deferred_arm_ready = false;
+    uint8_t deferred_arm = 3;
     bool phase_profile_ready = false;
     WorkloadFeatures prev_window_features;
 
@@ -509,6 +522,20 @@ private:
                       const WorkloadFeatures& mn,
                       const WorkloadFeatures& mx) const;
     bool record_contains(const WorkloadFeatures& p, const PolicyRecord& rec) const;
+    // Mean |Δ| / scale over structural features. A feature with no scale is
+    // skipped when the two values agree, and counts as a full mismatch when
+    // they do not.
+    double standardized_distance(const WorkloadFeatures& a,
+                                 const WorkloadFeatures& b,
+                                 const WorkloadFeatures& scale) const;
+    void note_regime_sample();
+    void finalize_regime_stats();
+    void assign_train_arm_from_mean();
+    void park_queue_after(PolicyRecord& rec, int arm) const;
+    void set_acceptance_box(PolicyRecord& rec) const;
+    void pool_stats(WorkloadFeatures& mean, WorkloadFeatures& stdev, uint32_t& count,
+                    const WorkloadFeatures& mean2, const WorkloadFeatures& std2,
+                    uint32_t count2) const;
     double calculate_aggregate_distance(const WorkloadFeatures& f1, const WorkloadFeatures& f2);
     void update_online_threshold(double current_delta);
     void save_config();
@@ -527,10 +554,10 @@ private:
     void write_features_csv(std::ostream& file, const WorkloadFeatures& f) const;
     double last_match_dist = 1e300;
     // Returns action string: upsert_new / upsert_replace / upsert_skip / ...
-    const char* upsert_policy(const WorkloadFeatures& center,
-                              const WorkloadFeatures& box_min,
-                              const WorkloadFeatures& box_max,
-                              bool has_box,
+    const char* upsert_policy(const WorkloadFeatures& mean,
+                              const WorkloadFeatures& stdev,
+                              uint32_t sample_count,
+                              double drift_limit,
                               int arm,
                               double miss_rate,
                               double delta,
@@ -607,6 +634,9 @@ public:
     size_t matrix_size() const { return policy_matrix.size(); }
     double get_shift_threshold() const { return shift_threshold; }
     uint8_t select_regime_arm(bool* out_matched = nullptr);
+    // TRAIN: after the defining window, the running arm switches to the one
+    // chosen for this regime. Returns false when no switch is waiting.
+    bool take_deferred_train_arm(uint8_t* out_arm);
     const std::vector<double>& get_active_policy_weights() const {
         return active_policy_weights;
     }
